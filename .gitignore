@@ -1,0 +1,65 @@
+# All folders starting with .
+.*/
+
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE files (folders covered by .*/ above)
+*.swp
+*.swo
+*~
+
+# Data directories (large files)
+data/
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.pickle
+
+# Results and outputs
+bbbc021_ablation_results/
+wandb/
+*.log
+*.csv
+!metadata.csv  # Keep metadata.csv if needed
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Keep Python files
+!*.py
+!README.md
+!LICENSE
+!requirements.txt
+!setup.py
+
