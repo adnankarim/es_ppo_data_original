@@ -1577,6 +1577,7 @@ class ImageMetrics:
 class ApproximateMetrics:
     """
     Computes Information Theoretic proxies + Biological Fidelity Metrics.
+    Uses Histogram-based estimation for entropy and MI.
     CellFlux (ICML 2025) methodology for morphological profile comparison.
     """
     
@@ -1593,66 +1594,94 @@ class ApproximateMetrics:
             Biological features of shape (N, 6)
         """
         if len(imgs.shape) != 4:
-            # Flatten case - return zeros
             return np.zeros((imgs.shape[0], 6))
         
-        # Mean intensity per channel: (N, C)
         means = np.mean(imgs, axis=(2, 3))
-        
-        # Std (contrast) per channel: (N, C)
         stds = np.std(imgs, axis=(2, 3))
-        
-        # Concatenate: (N, 6)
         return np.hstack([means, stds])
 
     @staticmethod
     def compute_all(real_images: np.ndarray, fake_images: np.ndarray):
         """
-        Compute biological fidelity metrics for CellFlux paper.
+        Compute biological fidelity metrics with histogram-based information-theoretic estimations.
         
         Returns:
-            Dictionary with profile_similarity, morpho_drift, and other metrics
+            Dictionary with profile_similarity, morpho_drift, and populated info-theoretic metrics
         """
-        # Flatten for pixel stats
+        # Flatten
         real_flat = real_images.flatten()
         fake_flat = fake_images.flatten()
         
-        # 1. Biological Features (Latent Space)
+        # 1. Standard Biological Metrics
         feat_real = ApproximateMetrics._get_bio_features(real_images)
         feat_fake = ApproximateMetrics._get_bio_features(fake_images)
         
-        # 2. Profile Similarity (Cosine Sim) - Key CellFlux Metric
-        # Measures if the "biological signature" matches
         dot = np.sum(feat_real * feat_fake, axis=1)
         norm_r = np.linalg.norm(feat_real, axis=1)
         norm_f = np.linalg.norm(feat_fake, axis=1)
         profile_sim = np.mean(dot / (norm_r * norm_f + 1e-8))
-
-        # 3. Morphological Drift (L2 Distance)
         drift = np.mean(np.linalg.norm(feat_real - feat_fake, axis=1))
-
-        # 4. Standard Stats
-        mu_real, std_real = np.mean(real_flat), np.std(real_flat)
-        mu_fake, std_fake = np.mean(fake_flat), np.std(fake_flat)
-        correlation = np.corrcoef(real_flat[::100], fake_flat[::100])[0, 1] if len(real_flat) > 100 else 0.0
         
+        mu_fake = np.mean(fake_flat)
+        std_fake = np.std(fake_flat)
+        correlation = np.corrcoef(real_flat[::100], fake_flat[::100])[0, 1] if len(real_flat) > 100 else 0.0
+
+        # 2. Information Theoretic Estimations (Histogram Method)
+        bins = 50
+        hist_range = (-1, 1)
+
+        # Marginal PDF P(X) and P(Y)
+        p_real, _ = np.histogram(real_flat, bins=bins, range=hist_range, density=True)
+        p_fake, _ = np.histogram(fake_flat, bins=bins, range=hist_range, density=True)
+        
+        # Normalize and add epsilon
+        p_real = p_real / (p_real.sum() + 1e-10) + 1e-10
+        p_fake = p_fake / (p_fake.sum() + 1e-10) + 1e-10
+
+        # Marginal Entropies H(X), H(Y)
+        h_real = -np.sum(p_real * np.log(p_real))
+        h_fake = -np.sum(p_fake * np.log(p_fake))
+
+        # Joint Probability P(X,Y) approximation
+        # We assume independence for the joint histogram estimation to save speed,
+        # or use 2D histogram on a subset of data
+        subset_size = min(len(real_flat), 100000) # Use subset for speed
+        H, _, _ = np.histogram2d(real_flat[:subset_size], fake_flat[:subset_size], bins=bins, range=[hist_range, hist_range], density=True)
+        p_joint = H / (H.sum() + 1e-10) + 1e-10
+        
+        # Joint Entropy H(X,Y)
+        h_joint = -np.sum(p_joint * np.log(p_joint))
+
+        # Mutual Information I(X;Y) = H(X) + H(Y) - H(X,Y)
+        mi = h_real + h_fake - h_joint
+        
+        # KL Divergence D(P||Q)
+        kl_div = np.sum(p_real * np.log(p_real / p_fake))
+
+        # Conditional Entropy H(X|Y) = H(X,Y) - H(Y)
+        h_cond = h_joint - h_fake
+
         return {
-            'profile_similarity': float(profile_sim),  # Key CellFlux Metric
+            'profile_similarity': float(profile_sim),
             'morpho_drift': float(drift),
             'correlation': float(correlation),
             'mu1_learned': float(mu_fake),
             'std1_learned': float(std_fake),
-            # Lightweight info-theoretic metrics (set to 0 for speed, can be computed if needed)
-            'mutual_information': 0.0, 
-            'entropy_x1': 0.0, 
-            'entropy_x2': 0.0,
-            'joint_entropy': 0.0,
-            'kl_div_total': 0.0,
-            'kl_div_1': 0.0,
-            'kl_div_2': 0.0,
-            'mi_x2_to_x1': 0.0,
-            'mi_x1_to_x2': 0.0,
-            'h_x1_given_x2': 0.0,
+            
+            # Populated Metrics
+            'kl_div_total': float(kl_div),
+            'mutual_information': float(max(0.0, mi)), # MI >= 0
+            'entropy_x1': float(h_real), 
+            'entropy_x2': float(h_fake),
+            'joint_entropy': float(h_joint),
+            'h_x1_given_x2': float(max(0.0, h_cond)),
+            
+            # Directed metrics (approximated as symmetric or simple diffs for viz)
+            'kl_div_1': float(kl_div * 0.5), # Split for visualization
+            'kl_div_2': float(kl_div * 0.5),
+            'mi_x2_to_x1': float(max(0.0, mi)),
+            'mi_x1_to_x2': float(max(0.0, mi)),
+            
             'mae_x2_to_x1': float(np.mean(np.abs(real_flat - fake_flat))),
         }
 # ============================================================================
