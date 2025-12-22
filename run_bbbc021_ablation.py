@@ -144,6 +144,9 @@ class BBBC021Config:
     # Model management
     reuse_pretrained: bool = True
     
+    # Biological constraints
+    enable_bio_loss: bool = False  # Enable DNA preservation loss in PPO
+    
     # Evaluation
     num_eval_samples: int = 500
     fid_batch_size: int = 64
@@ -1289,12 +1292,14 @@ class ImagePPOTrainer:
         ppo_clip: float = 0.1,
         lr: float = 5e-5,
         device: str = "cuda",
+        use_bio_loss: bool = False,
     ):
         self.cond_model = cond_model
         self.pretrain_model = pretrain_model
         self.kl_weight = kl_weight
         self.ppo_clip = ppo_clip
         self.device = torch.device(device)
+        self.use_bio_loss = use_bio_loss  # Store the flag
         
         # Freeze pretrained model
         self.pretrain_model.model.eval()
@@ -1336,13 +1341,17 @@ class ImagePPOTrainer:
         
         kl_loss = F.mse_loss(noise_pred_cond, noise_pred_pretrain)
         
-        # Biological Consistency Loss (MoA Regularization)
+        # Base loss
+        total_loss = reconstruction_loss + self.kl_weight * kl_loss
+        
+        # Conditional Biological Consistency Loss (MoA Regularization)
         # Ensures DNA channel (channel 2) is preserved - prevents hallucinating new cell locations
         # This ensures the model doesn't just change everything, but preserves the source DNA
-        dna_preservation = F.mse_loss(noise_pred_cond[:, 2, :, :], noise[:, 2, :, :])
-        
-        # Total loss with biological regularization
-        total_loss = reconstruction_loss + self.kl_weight * kl_loss + 0.1 * dna_preservation
+        if self.use_bio_loss:
+            # Channel 2 is DNA. We enforce that predicted noise for DNA matches 
+            # actual noise exactly (meaning the DNA structure shouldn't drift).
+            dna_preservation = F.mse_loss(noise_pred_cond[:, 2, :, :], noise[:, 2, :, :])
+            total_loss += 0.1 * dna_preservation
         
         # Backward
         self.optimizer.zero_grad()
@@ -1887,6 +1896,7 @@ class BBBC021AblationRunner:
             ppo_clip=ppo_clip,
             lr=lr,
             device=self.config.device,
+            use_bio_loss=self.config.enable_bio_loss,  # Pass flag from config
         )
         
         epoch_metrics = []
@@ -2849,6 +2859,10 @@ def main():
     parser.add_argument("--no-reuse-pretrained", action="store_true",
                        help="Train pretrained model from scratch")
     
+    # Biological constraints
+    parser.add_argument("--enable-bio-loss", action="store_true",
+                       help="Enable DNA preservation loss in PPO phase (CellFlux methodology)")
+    
     args = parser.parse_args()
     
     config = BBBC021Config(
@@ -2866,6 +2880,7 @@ def main():
         use_wandb=args.use_wandb,
         seed=args.seed,
         reuse_pretrained=not args.no_reuse_pretrained,
+        enable_bio_loss=args.enable_bio_loss,
     )
     
     runner = BBBC021AblationRunner(config)
