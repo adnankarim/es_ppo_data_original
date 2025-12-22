@@ -1898,7 +1898,7 @@ class BBBC021AblationRunner:
             # Plot every epoch
             self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'DDPM Pretraining')
             
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 2 == 0:
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
         
         ddpm.save(model_path)

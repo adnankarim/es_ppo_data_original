@@ -263,3 +263,4 @@ Adapted for CellFlux BBBC021 - December 2024
 ## Contributing
 
 Adnan KARIM
+python run_bbbc021_ablation.py --use-wandb --enable-bio-loss
