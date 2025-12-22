@@ -1345,12 +1345,14 @@ class ImagePPOTrainer:
         total_loss = reconstruction_loss + self.kl_weight * kl_loss
         
         # Conditional Biological Consistency Loss (MoA Regularization)
-        # Ensures DNA channel (channel 2) is preserved - prevents hallucinating new cell locations
+        # Ensures DNA channel (channel 0 = DAPI) is preserved - prevents hallucinating new cell locations
         # This ensures the model doesn't just change everything, but preserves the source DNA
         if self.use_bio_loss:
-            # Channel 2 is DNA. We enforce that predicted noise for DNA matches 
-            # actual noise exactly (meaning the DNA structure shouldn't drift).
-            dna_preservation = F.mse_loss(noise_pred_cond[:, 2, :, :], noise[:, 2, :, :])
+            # FIX: DAPI (DNA) is Index 0 in BBBC021Dataset, not Index 2.
+            # Channel order: 0=DAPI (DNA), 1=Phalloidin (Actin), 2=Tubulin
+            # We enforce that DNA noise prediction matches ground truth to anchor the nucleus.
+            # This prevents the model from moving nuclei while allowing cytoskeleton changes.
+            dna_preservation = F.mse_loss(noise_pred_cond[:, 0, :, :], noise[:, 0, :, :])
             total_loss += 0.1 * dna_preservation
         
         # Backward
