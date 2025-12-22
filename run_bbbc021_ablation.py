@@ -260,7 +260,7 @@ class BBBC021Dataset(Dataset):
     
     def _load_metadata(self, metadata_file: str) -> List[Dict]:
         """
-        Load metadata, construct Windows paths, and enforce CellFlux OOD logic.
+        Load metadata with IMPA column compatibility and Manual Splitting Logic.
         """
         metadata_path = self.data_dir / metadata_file
         
@@ -269,60 +269,94 @@ class BBBC021Dataset(Dataset):
             print("Generating synthetic metadata for testing...")
             return self._generate_synthetic_metadata()
         
-        # CellFlux ICML 2025 OOD Compound List
-        # These are REMOVED from training to test zero-shot generalization later.
+        # CellFlux OOD Compound List
         ood_compounds = {
             'docetaxel', 'AZ841', 'cytochalasin D', 'simvastatin', 
             'cyclohexamide', 'latrunculin B', 'epothilone B', 'lactacystin',
-            # Capitalized variants just in case
             'Docetaxel', 'Cytochalasin D', 'Simvastatin', 
             'Cyclohexamide', 'Latrunculin B', 'Epothilone B', 'Lactacystin'
         }
 
+        # --- MANUAL SPLIT DEFINITION (Aligned with CellFlux Paper) ---
+        # Training: Batches 0-6 (Week1 - Week7)
+        # Validation: Batches 7-8 (Week8 - Week9)
+        # Test: Batch 9 (Week10)
+        # Note: Adjust batch names based on what is actually in your 'batch' column
+        train_batches = {'batch_00', 'batch_01', 'batch_02', 'batch_03', 'batch_04', 'batch_05', 'batch_06', 
+                         'Week1', 'Week2', 'Week3', 'Week4', 'Week5', 'Week6', 'Week7'}
+        val_batches = {'batch_07', 'batch_08', 'Week8', 'Week9'}
+        test_batches = {'batch_09', 'Week10'}
+
         metadata = []
         
-        with open(metadata_path, 'r') as f:
+        with open(metadata_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                # 1. OOD Filtering Logic
-                compound = row.get('compound', 'DMSO')
-                is_ood = compound in ood_compounds
+                # 1. Basic Info
+                compound = row.get('compound') or row.get('CPD_NAME') or 'DMSO'
+                moa = row.get('moa') or row.get('ANNOT') or row.get('MOA') or ''
+                batch_name = row.get('batch', row.get('BATCH', row.get('Plate', row.get('PLATE', '0'))))
                 
-                # If we are training, SKIP the OOD drugs
-                if self.split == 'train' and is_ood:
-                    continue
+                # 2. Determine Split (If not explicit in CSV)
+                row_split = row.get('split') or row.get('SPLIT') or ''
                 
-                # 2. Split Logic (Train/Val/Test from CSV if available)
-                if 'split' in row and row['split'].lower() != self.split:
+                if not row_split:
+                    if batch_name in train_batches:
+                        row_split = 'train'
+                    elif batch_name in val_batches:
+                        row_split = 'val'
+                    elif batch_name in test_batches:
+                        row_split = 'test'
+                    else:
+                        # Fallback for unknown batches -> Train
+                        row_split = 'train'
+                else:
+                    # Normalize split value to lowercase
+                    row_split = row_split.lower()
+
+                # 3. Filtering
+                # Filter by Split
+                if row_split != self.split:
                     continue
 
-                # 3. Path Construction for Windows (Week/Plate/Image)
-                # The CSV likely has 'Week', 'Plate', and 'Image_FileName'
-                filename = row.get('image_path', '') or row.get('SAMPLE_KEY', '')
-                week = row.get('week', row.get('Week', ''))
-                plate = row.get('plate', row.get('Plate', ''))
-                
-                # Combine them: "Week1/22123/1_10_1.0.npy"
-                if week and plate and filename:
-                    full_image_path = os.path.join(week, plate, filename)
+                # Filter by OOD (Training only)
+                is_ood = compound in ood_compounds
+                if self.split == 'train' and is_ood:
+                    continue
+
+                # 4. Path Construction
+                filename = row.get('image_path') or row.get('SAMPLE_KEY') or row.get('file_path') or ''
+                if filename and '/' not in filename and '\\' not in filename:
+                    # Try to reconstruct path if just filename provided
+                    # Adjust this logic if your CSV has specific Week/Plate columns
+                    week = row.get('week', row.get('Week', ''))
+                    plate = row.get('plate', row.get('Plate', row.get('PLATE', '')))
+                    if week and plate:
+                         full_image_path = os.path.join(week, plate, filename)
+                    else:
+                         # Fallback: Assume the filename is unique enough or handled elsewhere
+                         full_image_path = filename
                 else:
                     full_image_path = filename
 
-                # 4. Parse Controls
+                # 5. Control Logic
                 is_control_val = row.get('is_control', '')
-                if isinstance(is_control_val, str):
-                    is_control = is_control_val.lower() in ('true', '1', 'yes')
+                if is_control_val != '':
+                    if isinstance(is_control_val, str):
+                        is_control = is_control_val.lower() in ('true', '1', 'yes')
+                    else:
+                        is_control = bool(is_control_val)
                 else:
-                    is_control = bool(is_control_val) or compound == 'DMSO'
+                    is_control = (compound.upper() == 'DMSO')
 
                 metadata.append({
                     'image_path': full_image_path,
                     'compound': compound,
-                    'concentration': float(row.get('concentration', 0)),
-                    'moa': row.get('moa', ''),
-                    'batch': row.get('batch', plate), # Use Plate as batch if 'batch' missing
+                    'concentration': float(row.get('concentration', row.get('DOSE', row.get('CONCENTRATION', 0)))),
+                    'moa': moa,
+                    'batch': batch_name,
                     'is_control': is_control,
-                    'smiles': row.get('smiles', ''),
+                    'smiles': row.get('smiles', row.get('SMILES', '')),
                 })
         
         return metadata
