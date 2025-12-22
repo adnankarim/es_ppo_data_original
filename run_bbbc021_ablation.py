@@ -97,8 +97,9 @@ class BBBC021Config:
     """Configuration for BBBC021 ablation study."""
     
     # Data paths
-    data_dir: str = "./data/bbbc021"  # Directory containing BBBC021 data
-    metadata_file: str = "metadata.csv"  # Metadata CSV file
+    # For IMPA dataset on Windows, use: r"C:\Users\dell\Downloads\IMPA_reproducibility\IMPA_reproducibility\datasets\bbbc021_all\bbbc021_all"
+    data_dir: str = "./data/bbbc021"  # Directory containing BBBC021 data (supports nested .npy files)
+    metadata_file: str = "metadata.csv"  # Metadata CSV file (or "metadata/bbbc021_df_all.csv" for IMPA)
     
     # Image settings
     image_size: int = 96
@@ -290,12 +291,23 @@ class BBBC021Dataset(Dataset):
                 else:
                     is_control = bool(is_control_val) or row.get('compound', 'DMSO') == 'DMSO'
                 
+                # Handle image path - support multiple column names and path formats
+                image_path = row.get('image_path', '') or row.get('SAMPLE_KEY', '') or row.get('file_path', '')
+                
+                # If path is incomplete (just filename), try to construct from Week/Plate columns
+                if image_path and '/' not in image_path and '\\' not in image_path:
+                    week = row.get('week', row.get('Week', ''))
+                    plate = row.get('plate', row.get('Plate', ''))
+                    if week and plate:
+                        # Construct nested path: WeekX/PlateY/filename
+                        image_path = f"{week}/{plate}/{image_path}"
+                
                 metadata.append({
-                    'image_path': row.get('image_path', ''),
+                    'image_path': image_path,
                     'compound': row.get('compound', 'DMSO'),
                     'concentration': float(row.get('concentration', 0)),
                     'moa': row.get('moa', ''),
-                    'batch': row.get('batch', row.get('plate', '0')),
+                    'batch': row.get('batch', row.get('plate', row.get('Plate', '0'))),
                     'well': row.get('well', ''),
                     'is_control': is_control,
                     'smiles': row.get('smiles', ''),
@@ -418,15 +430,64 @@ class BBBC021Dataset(Dataset):
         }
     
     def _load_image(self, image_path: str) -> torch.Tensor:
-        """Load image from path or generate synthetic."""
-        full_path = self.data_dir / "images" / image_path
-        
-        if full_path.exists():
-            image = Image.open(full_path).convert('RGB')
-            return self.transform(image)
+        """
+        Load image from path or generate synthetic.
+        Windows-compatible nested NumPy loader for IMPA dataset.
+        Supports both .npy files (IMPA) and .png files (standard BBBC021).
+        """
+        # Try .npy file first (IMPA dataset format)
+        if not image_path.endswith('.npy'):
+            npy_path = self.data_dir / f"{image_path}.npy"
         else:
-            # Generate synthetic image for testing
-            return self._generate_synthetic_image()
+            npy_path = self.data_dir / image_path
+        
+        if npy_path.exists():
+            # Load NumPy array [96, 96, 3] from IMPA dataset
+            try:
+                img_array = np.load(str(npy_path))
+                
+                # Handle different array shapes
+                if len(img_array.shape) == 3:
+                    # Transpose from [H, W, C] to [C, H, W]
+                    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+                elif len(img_array.shape) == 2:
+                    # Grayscale - convert to 3-channel
+                    img_tensor = torch.from_numpy(img_array).unsqueeze(0).repeat(3, 1, 1).float()
+                else:
+                    # Already in [C, H, W] format
+                    img_tensor = torch.from_numpy(img_array).float()
+                
+                # IMPA normalization: ensure values are in [0, 1] then scale to [-1, 1]
+                if img_tensor.max() > 1.0:
+                    img_tensor = img_tensor / 255.0
+                
+                # Normalize to [-1, 1] range
+                img_tensor = (img_tensor - 0.5) * 2.0
+                
+                # Resize if needed
+                if img_tensor.shape[1] != self.image_size or img_tensor.shape[2] != self.image_size:
+                    img_tensor = F.interpolate(
+                        img_tensor.unsqueeze(0),
+                        size=(self.image_size, self.image_size),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+                
+                return img_tensor
+            except Exception as e:
+                print(f"Warning: Failed to load .npy file {npy_path}: {e}")
+        
+        # Try standard image format in images/ subdirectory
+        full_path = self.data_dir / "images" / image_path
+        if full_path.exists():
+            try:
+                image = Image.open(full_path).convert('RGB')
+                return self.transform(image)
+            except Exception as e:
+                print(f"Warning: Failed to load image {full_path}: {e}")
+        
+        # Fallback: generate synthetic image for testing
+        return self._generate_synthetic_image()
     
     def _generate_synthetic_image(self) -> torch.Tensor:
         """Generate synthetic cell-like image for testing."""
@@ -505,12 +566,13 @@ class BatchPairedDataLoader:
         dataset: BBBC021Dataset,
         batch_size: int = 16,
         shuffle: bool = True,
-        num_workers: int = 4,
+        num_workers: int = None,
     ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.num_workers = num_workers
+        # Windows compatibility: default to 0 on Windows to avoid frozen process bug
+        self.num_workers = num_workers if num_workers is not None else (0 if os.name == 'nt' else 4)
         
         # Get perturbed indices
         self.perturbed_indices = dataset.get_perturbed_indices()
@@ -1685,11 +1747,13 @@ class BBBC021AblationRunner:
         # Get control images only
         control_indices = self.train_dataset.get_control_indices()
         control_dataset = Subset(self.train_dataset, control_indices)
+        # Windows compatibility: use num_workers=0 to avoid frozen process bug
+        num_workers = 0 if os.name == 'nt' else 4
         dataloader = DataLoader(
             control_dataset,
             batch_size=self.config.ddpm_batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
         )
         
         # Track metrics for plotting
