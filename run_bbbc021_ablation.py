@@ -260,7 +260,7 @@ class BBBC021Dataset(Dataset):
     
     def _load_metadata(self, metadata_file: str) -> List[Dict]:
         """
-        Load metadata with IMPA column compatibility and Manual Splitting Logic.
+        Load metadata with Robust Substring Splitting for Windows/IMPA.
         """
         metadata_path = self.data_dir / metadata_file
         
@@ -277,45 +277,41 @@ class BBBC021Dataset(Dataset):
             'Cyclohexamide', 'Latrunculin B', 'Epothilone B', 'Lactacystin'
         }
 
-        # --- MANUAL SPLIT DEFINITION (Aligned with CellFlux Paper) ---
-        # Training: Batches 0-6 (Week1 - Week7)
-        # Validation: Batches 7-8 (Week8 - Week9)
-        # Test: Batch 9 (Week10)
-        # Note: Adjust batch names based on what is actually in your 'batch' column
-        train_batches = {'batch_00', 'batch_01', 'batch_02', 'batch_03', 'batch_04', 'batch_05', 'batch_06', 
-                         'Week1', 'Week2', 'Week3', 'Week4', 'Week5', 'Week6', 'Week7'}
-        val_batches = {'batch_07', 'batch_08', 'Week8', 'Week9'}
-        test_batches = {'batch_09', 'Week10'}
-
         metadata = []
-        
+        # Debugging set to see what batches we actually find
+        found_batches = set()
+
         with open(metadata_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 # 1. Basic Info
                 compound = row.get('compound') or row.get('CPD_NAME') or 'DMSO'
                 moa = row.get('moa') or row.get('ANNOT') or row.get('MOA') or ''
-                batch_name = row.get('batch', row.get('BATCH', row.get('Plate', row.get('PLATE', '0'))))
-                
-                # 2. Determine Split (If not explicit in CSV)
+                # Get batch and strip whitespace
+                batch_name = str(row.get('batch', row.get('BATCH', row.get('Plate', row.get('PLATE', '0'))))).strip()
+                found_batches.add(batch_name)
+
+                # 2. Determine Split (Robust Substring Logic)
                 row_split = row.get('split') or row.get('SPLIT') or ''
                 
                 if not row_split:
-                    if batch_name in train_batches:
-                        row_split = 'train'
-                    elif batch_name in val_batches:
-                        row_split = 'val'
-                    elif batch_name in test_batches:
+                    # Check for keywords in the batch name (case insensitive)
+                    b_upper = batch_name.upper()
+                    
+                    # Test Set: Week 10 or Batch 09
+                    if 'WEEK10' in b_upper or 'WEEK 10' in b_upper or 'BATCH_09' in b_upper:
                         row_split = 'test'
+                    # Validation Set: Week 8, 9 or Batch 07, 08
+                    elif any(x in b_upper for x in ['WEEK8', 'WEEK 8', 'WEEK9', 'WEEK 9', 'BATCH_07', 'BATCH_08']):
+                        row_split = 'val'
+                    # Training Set: Everything else
                     else:
-                        # Fallback for unknown batches -> Train
                         row_split = 'train'
                 else:
                     # Normalize split value to lowercase
                     row_split = row_split.lower()
 
                 # 3. Filtering
-                # Filter by Split
                 if row_split != self.split:
                     continue
 
@@ -327,14 +323,11 @@ class BBBC021Dataset(Dataset):
                 # 4. Path Construction
                 filename = row.get('image_path') or row.get('SAMPLE_KEY') or row.get('file_path') or ''
                 if filename and '/' not in filename and '\\' not in filename:
-                    # Try to reconstruct path if just filename provided
-                    # Adjust this logic if your CSV has specific Week/Plate columns
-                    week = row.get('week', row.get('Week', ''))
-                    plate = row.get('plate', row.get('Plate', row.get('PLATE', '')))
+                    week = row.get('week') or row.get('Week') or ''
+                    plate = row.get('plate') or row.get('Plate') or row.get('PLATE') or ''
                     if week and plate:
                          full_image_path = os.path.join(week, plate, filename)
                     else:
-                         # Fallback: Assume the filename is unique enough or handled elsewhere
                          full_image_path = filename
                 else:
                     full_image_path = filename
@@ -359,6 +352,54 @@ class BBBC021Dataset(Dataset):
                     'smiles': row.get('smiles', row.get('SMILES', '')),
                 })
         
+        # Debug print only once per dataset initialization
+        if len(metadata) > 0 and self.split == 'train':
+            print(f"DEBUG: Found batches in CSV: {sorted(list(found_batches))[:20]}...")  # Show first 20 to avoid spam
+
+        # --- SAFETY FALLBACK FOR EMPTY SPLITS ---
+        # If we asked for validation but got nothing (due to batch naming mismatch),
+        # force a random split so the code doesn't crash.
+        if self.split == 'val' and len(metadata) == 0:
+            print("WARNING: No validation batches found matching naming convention.")
+            print("         Generating random validation split (10% of data).")
+            
+            # Re-read everything ignoring split rules
+            all_data = []
+            with open(metadata_path, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Basic parsing (copy from above or simplify)
+                    compound = row.get('compound') or row.get('CPD_NAME') or 'DMSO'
+                    filename = row.get('image_path') or row.get('SAMPLE_KEY') or ''
+                    
+                    # Skip OOD for safety
+                    if compound in ood_compounds: 
+                        continue
+                    
+                    # Quick path fix
+                    if filename and '/' not in filename and '\\' not in filename:
+                         week = row.get('week') or row.get('Week') or ''
+                         plate = row.get('plate') or row.get('Plate') or row.get('PLATE') or ''
+                         if week and plate: 
+                             filename = os.path.join(week, plate, filename)
+
+                    all_data.append({
+                        'image_path': filename,
+                        'compound': compound,
+                        'concentration': float(row.get('concentration', row.get('DOSE', row.get('CONCENTRATION', 0)))),
+                        'moa': row.get('moa') or row.get('ANNOT') or row.get('MOA') or '',
+                        'batch': 'fallback_batch',
+                        'is_control': (compound.upper() == 'DMSO'),
+                        'smiles': row.get('smiles', row.get('SMILES', '')),
+                    })
+            
+            # Deterministic Random Split
+            np.random.seed(42)
+            indices = np.random.permutation(len(all_data))
+            n_val = int(0.1 * len(all_data))
+            val_indices = indices[:n_val]
+            metadata = [all_data[i] for i in val_indices]
+
         return metadata
     
     def _generate_synthetic_metadata(self) -> List[Dict]:
