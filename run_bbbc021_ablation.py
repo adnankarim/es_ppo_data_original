@@ -1812,7 +1812,24 @@ class BBBC021AblationRunner:
         
         if self.config.use_wandb and WANDB_AVAILABLE:
             wandb.finish()
+    
+    def _get_gpu_stats(self) -> Dict[str, float]:
+        """Get GPU memory usage statistics."""
+        stats = {
+            'gpu_mem_allocated_mb': 0.0,
+            'gpu_mem_reserved_mb': 0.0,
+            'gpu_mem_max_mb': 0.0
+        }
         
+        if torch.cuda.is_available():
+            # Current memory allocated to tensors
+            stats['gpu_mem_allocated_mb'] = torch.cuda.memory_allocated() / 1024**2
+            # Total memory reserved by PyTorch (cached)
+            stats['gpu_mem_reserved_mb'] = torch.cuda.memory_reserved() / 1024**2
+            # Peak memory usage since last reset
+            stats['gpu_mem_max_mb'] = torch.cuda.max_memory_allocated() / 1024**2
+            
+        return stats
     
     def _pretrain_ddpm(self) -> ImageDDPM:
         """Pretrain unconditional DDPM on control images."""
@@ -1854,6 +1871,10 @@ class BBBC021AblationRunner:
         os.makedirs(pretrain_plot_dir, exist_ok=True)
         
         for epoch in range(self.config.ddpm_epochs):
+            # Reset peak memory stats at start of epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            
             epoch_losses = []
             for batch in dataloader:
                 images = batch['image'].to(self.config.device)
@@ -1862,18 +1883,23 @@ class BBBC021AblationRunner:
             
             avg_loss = np.mean(epoch_losses)
             
+            # Get GPU stats
+            gpu_stats = self._get_gpu_stats()
+            
             # Evaluate and track metrics
             metrics = self._evaluate_pretrain(ddpm, control_dataset)
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['phase'] = 'pretraining'
+            # Add GPU stats to metrics
+            metrics.update(gpu_stats)
             pretrain_metrics.append(metrics)
             
             # Plot every epoch
             self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'DDPM Pretraining')
             
             if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
         
         ddpm.save(model_path)
         print(f"  Saved pretrained model to {model_path}")
@@ -1932,6 +1958,10 @@ class BBBC021AblationRunner:
         print(f"    Warmup phase: {self.config.warmup_epochs} epochs...")
         warmup_metrics = []
         for warmup_epoch in range(self.config.warmup_epochs):
+            # Reset peak memory stats at start of epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            
             warmup_losses = []
             for batch in dataloader:
                 control = batch['control'].to(self.config.device)
@@ -1943,6 +1973,9 @@ class BBBC021AblationRunner:
             
             avg_loss = np.mean(warmup_losses)
             
+            # Get GPU stats
+            gpu_stats = self._get_gpu_stats()
+            
             # Evaluate during warmup
             metrics = self._evaluate(cond_ddpm)
             metrics['epoch'] = warmup_epoch + 1
@@ -1950,6 +1983,8 @@ class BBBC021AblationRunner:
             metrics['sigma'] = sigma
             metrics['lr'] = lr
             metrics['phase'] = 'warmup'
+            # Add GPU stats to metrics
+            metrics.update(gpu_stats)
             warmup_metrics.append(metrics)
             
             # Plot during warmup
@@ -1973,6 +2008,10 @@ class BBBC021AblationRunner:
         )
         
         for epoch in range(self.config.coupling_epochs):
+            # Reset peak memory stats at start of epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            
             epoch_losses = []
             
             for batch in dataloader:
@@ -1985,6 +2024,9 @@ class BBBC021AblationRunner:
             
             avg_loss = np.mean(epoch_losses)
             
+            # Get GPU stats
+            gpu_stats = self._get_gpu_stats()
+            
             # Evaluate
             metrics = self._evaluate(cond_ddpm)
             # Continue epoch numbering from warmup
@@ -1993,6 +2035,8 @@ class BBBC021AblationRunner:
             metrics['sigma'] = sigma
             metrics['lr'] = lr
             metrics['phase'] = 'training'  # ES training phase
+            # Add GPU stats to metrics
+            metrics.update(gpu_stats)
             epoch_metrics.append(metrics)
             
             # Plot checkpoint
@@ -2001,7 +2045,7 @@ class BBBC021AblationRunner:
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', f'σ={sigma}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}")
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2009,6 +2053,7 @@ class BBBC021AblationRunner:
                     f'ES/config_{config_idx}/loss': avg_loss,
                     f'ES/config_{config_idx}/fid': metrics['fid'],
                     f'ES/config_{config_idx}/mse': metrics['mse'],
+                    f'ES/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
         
         final_metrics = epoch_metrics[-1]
@@ -2060,6 +2105,10 @@ class BBBC021AblationRunner:
         epoch_metrics = []
         
         for epoch in range(self.config.coupling_epochs):
+            # Reset peak memory stats at start of epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            
             epoch_losses = []
             
             for batch in dataloader:
@@ -2072,6 +2121,9 @@ class BBBC021AblationRunner:
             
             avg_loss = np.mean(epoch_losses)
             
+            # Get GPU stats
+            gpu_stats = self._get_gpu_stats()
+            
             # Evaluate
             metrics = self._evaluate(cond_ddpm)
             metrics['epoch'] = epoch + 1
@@ -2080,6 +2132,8 @@ class BBBC021AblationRunner:
             metrics['ppo_clip'] = ppo_clip
             metrics['lr'] = lr
             metrics['phase'] = 'training'  # PPO training phase
+            # Add GPU stats to metrics
+            metrics.update(gpu_stats)
             epoch_metrics.append(metrics)
             
             # Plot checkpoint
@@ -2088,7 +2142,7 @@ class BBBC021AblationRunner:
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', f'KL={kl_weight}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}")
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2096,6 +2150,7 @@ class BBBC021AblationRunner:
                     f'PPO/config_{config_idx}/loss': avg_loss,
                     f'PPO/config_{config_idx}/fid': metrics['fid'],
                     f'PPO/config_{config_idx}/mse': metrics['mse'],
+                    f'PPO/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
         
         final_metrics = epoch_metrics[-1]
