@@ -1590,6 +1590,11 @@ class BBBC021AblationRunner:
             num_workers=4,
         )
         
+        # Track metrics for plotting
+        pretrain_metrics = []
+        pretrain_plot_dir = os.path.join(self.plots_dir, "pretraining")
+        os.makedirs(pretrain_plot_dir, exist_ok=True)
+        
         for epoch in range(self.config.ddpm_epochs):
             epoch_losses = []
             for batch in dataloader:
@@ -1599,8 +1604,18 @@ class BBBC021AblationRunner:
             
             avg_loss = np.mean(epoch_losses)
             
+            # Evaluate and track metrics
+            metrics = self._evaluate_pretrain(ddpm, control_dataset)
+            metrics['epoch'] = epoch + 1
+            metrics['loss'] = avg_loss
+            metrics['phase'] = 'pretraining'
+            pretrain_metrics.append(metrics)
+            
+            # Plot every epoch
+            self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'DDPM Pretraining')
+            
             if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
         
         ddpm.save(model_path)
         print(f"  Saved pretrained model to {model_path}")
@@ -1657,6 +1672,7 @@ class BBBC021AblationRunner:
         
         # Warmup phase (gradient training)
         print(f"    Warmup phase: {self.config.warmup_epochs} epochs...")
+        warmup_metrics = []
         for warmup_epoch in range(self.config.warmup_epochs):
             warmup_losses = []
             for batch in dataloader:
@@ -1667,8 +1683,27 @@ class BBBC021AblationRunner:
                 loss = cond_ddpm.train_step(perturbed, control, fingerprint)
                 warmup_losses.append(loss)
             
+            avg_loss = np.mean(warmup_losses)
+            
+            # Evaluate during warmup
+            metrics = self._evaluate(cond_ddpm)
+            metrics['epoch'] = warmup_epoch + 1
+            metrics['loss'] = avg_loss
+            metrics['sigma'] = sigma
+            metrics['lr'] = lr
+            metrics['phase'] = 'warmup'
+            warmup_metrics.append(metrics)
+            
+            # Plot during warmup
+            checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            self._plot_checkpoint(warmup_metrics, checkpoint_dir, warmup_epoch, 'ES', f'σ={sigma}, lr={lr}')
+            
             if (warmup_epoch + 1) % 3 == 0:
-                print(f"      Warmup epoch {warmup_epoch+1}, Loss: {np.mean(warmup_losses):.4f}")
+                print(f"      Warmup epoch {warmup_epoch+1}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
+        
+        # Initialize epoch_metrics with warmup metrics
+        epoch_metrics = warmup_metrics.copy()
         
         # ES training
         es_trainer = ImageESTrainer(
@@ -1678,8 +1713,6 @@ class BBBC021AblationRunner:
             lr=lr,
             device=self.config.device,
         )
-        
-        epoch_metrics = []
         
         for epoch in range(self.config.coupling_epochs):
             epoch_losses = []
@@ -1696,13 +1729,15 @@ class BBBC021AblationRunner:
             
             # Evaluate
             metrics = self._evaluate(cond_ddpm)
-            metrics['epoch'] = epoch + 1
+            # Continue epoch numbering from warmup
+            metrics['epoch'] = len(epoch_metrics) + 1
             metrics['loss'] = avg_loss
             metrics['sigma'] = sigma
             metrics['lr'] = lr
+            metrics['phase'] = 'training'  # ES training phase
             epoch_metrics.append(metrics)
             
-            # [ADD THIS LINE HERE]
+            # Plot checkpoint
             checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
             os.makedirs(checkpoint_dir, exist_ok=True)
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', f'σ={sigma}, lr={lr}')
@@ -1769,17 +1804,15 @@ class BBBC021AblationRunner:
             
             # Evaluate
             metrics = self._evaluate(cond_ddpm)
-            # [FIND THIS SECTION INSIDE _run_ppo_experiment]
-            
-            # ... (after metrics evaluation) ...
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['kl_weight'] = kl_weight
             metrics['ppo_clip'] = ppo_clip
             metrics['lr'] = lr
+            metrics['phase'] = 'training'  # PPO training phase
             epoch_metrics.append(metrics)
             
-            # [ADD THIS LINE HERE]
+            # Plot checkpoint
             checkpoint_dir = os.path.join(self.plots_dir, f'PPO_config_{config_idx}')
             os.makedirs(checkpoint_dir, exist_ok=True)
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', f'KL={kl_weight}, lr={lr}')
@@ -1854,6 +1887,300 @@ class BBBC021AblationRunner:
         metrics.update(info_metrics) # Merge dictionaries
         
         return metrics
+    
+    def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset: Subset) -> Dict:
+        """Evaluate pretrained unconditional DDPM."""
+        ddpm.model.eval()
+        
+        # Sample some images
+        num_samples = min(100, len(dataset))
+        real_images = []
+        fake_images = []
+        
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+        
+        with torch.no_grad():
+            # Get real images
+            for i, batch in enumerate(dataloader):
+                if len(real_images) >= num_samples:
+                    break
+                images = batch['image'].to(self.config.device)
+                real_images.append(images.cpu().numpy())
+            
+            # Generate fake images
+            generated = ddpm.sample(num_samples, num_steps=self.config.num_sampling_steps)
+            fake_images.append(generated.cpu().numpy())
+        
+        real_images = np.concatenate(real_images, axis=0)[:num_samples]
+        fake_images = np.concatenate(fake_images, axis=0)[:num_samples]
+        
+        # Compute metrics
+        fid = ImageMetrics.compute_fid(real_images, fake_images)
+        mse = ImageMetrics.compute_mse(real_images, fake_images)
+        mae = ImageMetrics.compute_mae(real_images, fake_images)
+        ssim = ImageMetrics.compute_ssim(real_images, fake_images)
+        
+        # Information theoretic metrics
+        info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
+        
+        metrics = {
+            'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim,
+        }
+        metrics.update(info_metrics)
+        
+        return metrics
+    
+    def _save_metrics_to_csv(self, metrics: List[Dict], checkpoint_dir: str, method: str, config_str: str = ""):
+        """Save metrics to CSV file."""
+        if not metrics:
+            return
+        
+        csv_path = os.path.join(checkpoint_dir, f"{method}_metrics.csv")
+        fieldnames = list(metrics[0].keys())
+        
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(metrics)
+    
+    def _plot_checkpoint(self, epoch_metrics: List[Dict], checkpoint_dir: str, epoch: int, method: str, config_str: str):
+        """Generate comprehensive checkpoint plot (including warmup epochs with shading)."""
+        if len(epoch_metrics) < 1:
+            return
+        
+        # Include ALL epochs for full picture
+        all_metrics = epoch_metrics
+        warmup_metrics = [m for m in all_metrics if m.get('phase') == 'warmup']
+        training_metrics = [m for m in all_metrics if m.get('phase') in ['training', 'pretraining']]
+        
+        if len(all_metrics) < 1:
+            return  # Not enough data yet
+        
+        # Save metrics to CSV
+        self._save_metrics_to_csv(all_metrics, checkpoint_dir, method, config_str)
+        
+        epochs = [m['epoch'] for m in all_metrics]
+        
+        # Find warmup/training boundary for vertical line
+        warmup_boundary = None
+        if warmup_metrics and training_metrics:
+            warmup_end = max([m['epoch'] for m in warmup_metrics])
+            training_start = min([m['epoch'] for m in training_metrics])
+            warmup_boundary = (warmup_end + training_start) / 2.0
+        
+        # Create comprehensive plot with ALL metrics
+        fig = plt.figure(figsize=(24, 16))
+        gs = GridSpec(4, 4, figure=fig, hspace=0.3, wspace=0.3)
+        
+        # Helper function to plot with warmup/training boundary
+        def plot_metric(ax, all_epochs, all_values, ylabel, title, color='blue'):
+            """Plot metric with phase boundary line."""
+            ax.plot(all_epochs, all_values, color=color, linewidth=2, 
+                   marker='o', markersize=4, alpha=0.8, label=method)
+            
+            # Add vertical line at warmup/training boundary
+            if warmup_boundary is not None:
+                ax.axvline(x=warmup_boundary, color='gray', linestyle='--', 
+                          linewidth=1.5, alpha=0.6, label='Warmup|Training')
+            
+            ax.set_xlabel('Epoch', fontsize=10)
+            ax.set_ylabel(ylabel, fontsize=10)
+            ax.set_title(title, fontsize=11, fontweight='bold')
+            ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.3)
+        
+        # Row 1: Primary metrics
+        ax1 = fig.add_subplot(gs[0, 0])
+        plot_metric(ax1, epochs, [m['loss'] for m in all_metrics], 
+                   'Loss', 'Training Loss', 'navy')
+        
+        ax2 = fig.add_subplot(gs[0, 1])
+        if 'kl_div_total' in all_metrics[0]:
+            plot_metric(ax2, epochs, [m.get('kl_div_total', 0) for m in all_metrics], 
+                       'KL Divergence', 'KL Divergence', 'darkred')
+        else:
+            ax2.text(0.5, 0.5, 'KL Div not available', ha='center', va='center', transform=ax2.transAxes)
+            ax2.set_title('KL Divergence')
+        
+        ax3 = fig.add_subplot(gs[0, 2])
+        if 'correlation' in all_metrics[0]:
+            plot_metric(ax3, epochs, [m.get('correlation', 0) for m in all_metrics], 
+                       'Correlation', 'Correlation', 'darkgreen')
+        else:
+            ax3.text(0.5, 0.5, 'Correlation not available', ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title('Correlation')
+        
+        ax4 = fig.add_subplot(gs[0, 3])
+        plot_metric(ax4, epochs, [m.get('mae', m.get('mae_x2_to_x1', 0)) for m in all_metrics], 
+                   'MAE', 'Mean Absolute Error', 'purple')
+        
+        # Row 2: Image quality metrics
+        ax5 = fig.add_subplot(gs[1, 0])
+        plot_metric(ax5, epochs, [m.get('fid', 0) for m in all_metrics], 
+                   'FID', 'Fréchet Inception Distance', 'darkorange')
+        
+        ax6 = fig.add_subplot(gs[1, 1])
+        plot_metric(ax6, epochs, [m.get('mse', 0) for m in all_metrics], 
+                   'MSE', 'Mean Squared Error', 'crimson')
+        
+        ax7 = fig.add_subplot(gs[1, 2])
+        plot_metric(ax7, epochs, [m.get('ssim', 0) for m in all_metrics], 
+                   'SSIM', 'Structural Similarity Index', 'teal')
+        
+        ax8 = fig.add_subplot(gs[1, 3])
+        if 'mutual_information' in all_metrics[0]:
+            plot_metric(ax8, epochs, [m.get('mutual_information', 0) for m in all_metrics], 
+                       'Mutual Information', 'Mutual Information I(X;Y)', 'purple')
+        else:
+            ax8.text(0.5, 0.5, 'MI not available', ha='center', va='center', transform=ax8.transAxes)
+            ax8.set_title('Mutual Information')
+        
+        # Row 3: Information theoretic metrics
+        ax9 = fig.add_subplot(gs[2, 0])
+        if 'entropy_x1' in all_metrics[0] and 'entropy_x2' in all_metrics[0]:
+            ax9.plot(epochs, [m.get('entropy_x1', 0) for m in all_metrics], 
+                    'b-', linewidth=2, marker='o', label='H(X1)', markersize=4)
+            ax9.plot(epochs, [m.get('entropy_x2', 0) for m in all_metrics], 
+                    'r-', linewidth=2, marker='o', label='H(X2)', markersize=4)
+            if warmup_boundary is not None:
+                ax9.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax9.set_xlabel('Epoch', fontsize=10)
+            ax9.set_ylabel('Entropy', fontsize=10)
+            ax9.set_title('Marginal Entropies', fontsize=11, fontweight='bold')
+            ax9.legend(fontsize=8)
+            ax9.grid(True, alpha=0.3)
+        else:
+            ax9.text(0.5, 0.5, 'Entropy not available', ha='center', va='center', transform=ax9.transAxes)
+            ax9.set_title('Marginal Entropies')
+        
+        ax10 = fig.add_subplot(gs[2, 1])
+        if 'joint_entropy' in all_metrics[0]:
+            ax10.plot(epochs, [m.get('joint_entropy', 0) for m in all_metrics], 
+                     'purple', linewidth=2, marker='o', markersize=4)
+            if warmup_boundary is not None:
+                ax10.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax10.set_xlabel('Epoch', fontsize=10)
+            ax10.set_ylabel('Joint Entropy', fontsize=10)
+            ax10.set_title('Joint Entropy H(X,Y)', fontsize=11, fontweight='bold')
+            ax10.grid(True, alpha=0.3)
+        else:
+            ax10.text(0.5, 0.5, 'Joint Entropy not available', ha='center', va='center', transform=ax10.transAxes)
+            ax10.set_title('Joint Entropy')
+        
+        ax11 = fig.add_subplot(gs[2, 2])
+        if 'h_x1_given_x2' in all_metrics[0]:
+            ax11.plot(epochs, [m.get('h_x1_given_x2', 0) for m in all_metrics], 
+                     'b-', linewidth=2, marker='o', label='H(X1|X2)', markersize=4)
+            if warmup_boundary is not None:
+                ax11.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax11.set_xlabel('Epoch', fontsize=10)
+            ax11.set_ylabel('Conditional Entropy', fontsize=10)
+            ax11.set_title('Conditional Entropy', fontsize=11, fontweight='bold')
+            ax11.legend(fontsize=8)
+            ax11.grid(True, alpha=0.3)
+        else:
+            ax11.text(0.5, 0.5, 'Conditional Entropy not available', ha='center', va='center', transform=ax11.transAxes)
+            ax11.set_title('Conditional Entropy')
+        
+        ax12 = fig.add_subplot(gs[2, 3])
+        if 'kl_div_1' in all_metrics[0] and 'kl_div_2' in all_metrics[0]:
+            ax12.plot(epochs, [m.get('kl_div_1', 0) for m in all_metrics], 
+                     'b-', linewidth=2, marker='o', label='KL(X1)', markersize=4)
+            ax12.plot(epochs, [m.get('kl_div_2', 0) for m in all_metrics], 
+                     'r-', linewidth=2, marker='o', label='KL(X2)', markersize=4)
+            if warmup_boundary is not None:
+                ax12.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax12.set_xlabel('Epoch', fontsize=10)
+            ax12.set_ylabel('KL Divergence', fontsize=10)
+            ax12.set_title('Individual KL Components', fontsize=11, fontweight='bold')
+            ax12.legend(fontsize=8)
+            ax12.grid(True, alpha=0.3)
+        else:
+            ax12.text(0.5, 0.5, 'KL components not available', ha='center', va='center', transform=ax12.transAxes)
+            ax12.set_title('Individual KL Components')
+        
+        # Row 4: Learned statistics and summary
+        ax13 = fig.add_subplot(gs[3, 0])
+        if 'mu1_learned' in all_metrics[0]:
+            ax13.plot(epochs, [m.get('mu1_learned', 0) for m in all_metrics], 
+                     'b-', linewidth=2, marker='o', label='μ1 learned', markersize=4)
+            ax13.axhline(y=0.0, color='b', linestyle='--', alpha=0.5, label='μ1 target (0.0)')
+            if warmup_boundary is not None:
+                ax13.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax13.set_xlabel('Epoch', fontsize=10)
+            ax13.set_ylabel('Mean', fontsize=10)
+            ax13.set_title('Learned Mean', fontsize=11, fontweight='bold')
+            ax13.legend(fontsize=8)
+            ax13.grid(True, alpha=0.3)
+        else:
+            ax13.text(0.5, 0.5, 'Mean not available', ha='center', va='center', transform=ax13.transAxes)
+            ax13.set_title('Learned Mean')
+        
+        ax14 = fig.add_subplot(gs[3, 1])
+        if 'std1_learned' in all_metrics[0]:
+            ax14.plot(epochs, [m.get('std1_learned', 0) for m in all_metrics], 
+                     'b-', linewidth=2, marker='o', label='σ1 learned', markersize=4)
+            ax14.axhline(y=1.0, color='b', linestyle='--', alpha=0.5, label='σ1 target (1.0)')
+            if warmup_boundary is not None:
+                ax14.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
+            ax14.set_xlabel('Epoch', fontsize=10)
+            ax14.set_ylabel('Std Dev', fontsize=10)
+            ax14.set_title('Learned Std Dev', fontsize=11, fontweight='bold')
+            ax14.legend(fontsize=8)
+            ax14.grid(True, alpha=0.3)
+        else:
+            ax14.text(0.5, 0.5, 'Std Dev not available', ha='center', va='center', transform=ax14.transAxes)
+            ax14.set_title('Learned Std Dev')
+        
+        # Summary metrics table
+        ax15 = fig.add_subplot(gs[3, 2:])
+        ax15.axis('off')
+        latest = all_metrics[-1]
+        initial = all_metrics[0] if all_metrics else latest
+        
+        summary_text = f"""
+{method} Training Summary - {config_str}
+{'='*60}
+Epoch: {latest.get('epoch', 'N/A')} / {max([m.get('epoch', 0) for m in all_metrics])}
+
+Primary Metrics:
+  Loss:        {latest.get('loss', 0):.6f} (initial: {initial.get('loss', 0):.6f})
+  FID:         {latest.get('fid', 0):.4f} (initial: {initial.get('fid', 0):.4f})
+  MSE:         {latest.get('mse', 0):.6f} (initial: {initial.get('mse', 0):.6f})
+  MAE:         {latest.get('mae', 0):.6f} (initial: {initial.get('mae', 0):.6f})
+  SSIM:        {latest.get('ssim', 0):.4f} (initial: {initial.get('ssim', 0):.4f})
+
+Information Theoretic:
+  MI:          {latest.get('mutual_information', 0):.4f}
+  KL Div:      {latest.get('kl_div_total', 0):.4f}
+  Correlation: {latest.get('correlation', 0):.4f}
+  Entropy X1:  {latest.get('entropy_x1', 0):.4f}
+  Entropy X2:  {latest.get('entropy_x2', 0):.4f}
+  Joint Ent:   {latest.get('joint_entropy', 0):.4f}
+
+Learned Statistics:
+  Mean:        {latest.get('mu1_learned', 0):.4f}
+  Std Dev:     {latest.get('std1_learned', 0):.4f}
+"""
+        
+        ax15.text(0.05, 0.95, summary_text, transform=ax15.transAxes, 
+                 fontsize=9, verticalalignment='top', family='monospace',
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Add title
+        fig.suptitle(f'{method} Training Progress - {config_str}', 
+                     fontsize=14, fontweight='bold', y=0.995)
+        
+        # Save plot
+        plot_path = os.path.join(checkpoint_dir, f'{method}_epoch_{epoch+1:04d}.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Also save latest plot with fixed name for easy access
+        latest_plot_path = os.path.join(checkpoint_dir, f'{method}_latest.png')
+        import shutil
+        if os.path.exists(plot_path):
+            shutil.copy(plot_path, latest_plot_path)
     
     def _generate_summary(self):
         """Generate ablation summary."""
