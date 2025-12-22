@@ -260,8 +260,7 @@ class BBBC021Dataset(Dataset):
     
     def _load_metadata(self, metadata_file: str) -> List[Dict]:
         """
-        Load and parse metadata CSV.
-        Respects 'split' column if present (CellFlux methodology), otherwise uses random split.
+        Load metadata, construct Windows paths, and enforce CellFlux OOD logic.
         """
         metadata_path = self.data_dir / metadata_file
         
@@ -270,70 +269,61 @@ class BBBC021Dataset(Dataset):
             print("Generating synthetic metadata for testing...")
             return self._generate_synthetic_metadata()
         
+        # CellFlux ICML 2025 OOD Compound List
+        # These are REMOVED from training to test zero-shot generalization later.
+        ood_compounds = {
+            'docetaxel', 'AZ841', 'cytochalasin D', 'simvastatin', 
+            'cyclohexamide', 'latrunculin B', 'epothilone B', 'lactacystin',
+            # Capitalized variants just in case
+            'Docetaxel', 'Cytochalasin D', 'Simvastatin', 
+            'Cyclohexamide', 'Latrunculin B', 'Epothilone B', 'Lactacystin'
+        }
+
         metadata = []
-        has_split_column = False
         
         with open(metadata_path, 'r') as f:
             reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames or []
-            has_split_column = 'split' in fieldnames
-            
             for row in reader:
-                # Filter by Split (Train/Val/Test) if column exists
-                if has_split_column:
-                    if row.get('split', '').lower() != self.split.lower():
-                        continue
+                # 1. OOD Filtering Logic
+                compound = row.get('compound', 'DMSO')
+                is_ood = compound in ood_compounds
                 
-                # Parse is_control (handle both string and boolean)
+                # If we are training, SKIP the OOD drugs
+                if self.split == 'train' and is_ood:
+                    continue
+                
+                # 2. Split Logic (Train/Val/Test from CSV if available)
+                if 'split' in row and row['split'].lower() != self.split:
+                    continue
+
+                # 3. Path Construction for Windows (Week/Plate/Image)
+                # The CSV likely has 'Week', 'Plate', and 'Image_FileName'
+                filename = row.get('image_path', '') or row.get('SAMPLE_KEY', '')
+                week = row.get('week', row.get('Week', ''))
+                plate = row.get('plate', row.get('Plate', ''))
+                
+                # Combine them: "Week1/22123/1_10_1.0.npy"
+                if week and plate and filename:
+                    full_image_path = os.path.join(week, plate, filename)
+                else:
+                    full_image_path = filename
+
+                # 4. Parse Controls
                 is_control_val = row.get('is_control', '')
                 if isinstance(is_control_val, str):
                     is_control = is_control_val.lower() in ('true', '1', 'yes')
                 else:
-                    is_control = bool(is_control_val) or row.get('compound', 'DMSO') == 'DMSO'
-                
-                # Handle image path - support multiple column names and path formats
-                image_path = row.get('image_path', '') or row.get('SAMPLE_KEY', '') or row.get('file_path', '')
-                
-                # If path is incomplete (just filename), try to construct from Week/Plate columns
-                if image_path and '/' not in image_path and '\\' not in image_path:
-                    week = row.get('week', row.get('Week', ''))
-                    plate = row.get('plate', row.get('Plate', ''))
-                    if week and plate:
-                        # Construct nested path: WeekX/PlateY/filename
-                        image_path = f"{week}/{plate}/{image_path}"
-                
+                    is_control = bool(is_control_val) or compound == 'DMSO'
+
                 metadata.append({
-                    'image_path': image_path,
-                    'compound': row.get('compound', 'DMSO'),
+                    'image_path': full_image_path,
+                    'compound': compound,
                     'concentration': float(row.get('concentration', 0)),
                     'moa': row.get('moa', ''),
-                    'batch': row.get('batch', row.get('plate', row.get('Plate', '0'))),
-                    'well': row.get('well', ''),
+                    'batch': row.get('batch', plate), # Use Plate as batch if 'batch' missing
                     'is_control': is_control,
                     'smiles': row.get('smiles', ''),
                 })
-        
-        # Fallback: Random split if metadata has no 'split' column
-        if not has_split_column and not metadata:
-            print("WARNING: Metadata missing 'split' column. Using random split.")
-            # This shouldn't happen if we have data, but handle edge case
-            return []
-        elif not has_split_column and metadata:
-            print("WARNING: Metadata missing 'split' column. Using random split.")
-            # Apply random split as fallback
-            np.random.seed(42)
-            indices = np.random.permutation(len(metadata))
-            n_train = int(0.7 * len(metadata))
-            n_val = int(0.15 * len(metadata))
-            
-            if self.split == "train":
-                selected_indices = indices[:n_train]
-            elif self.split == "val":
-                selected_indices = indices[n_train:n_train + n_val]
-            else:  # test
-                selected_indices = indices[n_train + n_val:]
-            
-            return [metadata[i] for i in selected_indices]
         
         return metadata
     
@@ -431,63 +421,46 @@ class BBBC021Dataset(Dataset):
     
     def _load_image(self, image_path: str) -> torch.Tensor:
         """
-        Load image from path or generate synthetic.
-        Windows-compatible nested NumPy loader for IMPA dataset.
-        Supports both .npy files (IMPA) and .png files (standard BBBC021).
+        Load 16-bit NumPy array from IMPA dataset and normalize for DDPM.
         """
-        # Try .npy file first (IMPA dataset format)
+        # Ensure extension
         if not image_path.endswith('.npy'):
-            npy_path = self.data_dir / f"{image_path}.npy"
-        else:
-            npy_path = self.data_dir / image_path
+            image_path += '.npy'
+            
+        # Use pathlib to handle Windows backslashes automatically
+        full_path = self.data_dir / image_path
         
-        if npy_path.exists():
-            # Load NumPy array [96, 96, 3] from IMPA dataset
-            try:
-                img_array = np.load(str(npy_path))
-                
-                # Handle different array shapes
-                if len(img_array.shape) == 3:
-                    # Transpose from [H, W, C] to [C, H, W]
-                    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
-                elif len(img_array.shape) == 2:
-                    # Grayscale - convert to 3-channel
-                    img_tensor = torch.from_numpy(img_array).unsqueeze(0).repeat(3, 1, 1).float()
-                else:
-                    # Already in [C, H, W] format
-                    img_tensor = torch.from_numpy(img_array).float()
-                
-                # IMPA normalization: ensure values are in [0, 1] then scale to [-1, 1]
-                if img_tensor.max() > 1.0:
-                    img_tensor = img_tensor / 255.0
-                
-                # Normalize to [-1, 1] range
-                img_tensor = (img_tensor - 0.5) * 2.0
-                
-                # Resize if needed
-                if img_tensor.shape[1] != self.image_size or img_tensor.shape[2] != self.image_size:
-                    img_tensor = F.interpolate(
-                        img_tensor.unsqueeze(0),
-                        size=(self.image_size, self.image_size),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)
-                
-                return img_tensor
-            except Exception as e:
-                print(f"Warning: Failed to load .npy file {npy_path}: {e}")
-        
-        # Try standard image format in images/ subdirectory
-        full_path = self.data_dir / "images" / image_path
         if full_path.exists():
             try:
-                image = Image.open(full_path).convert('RGB')
-                return self.transform(image)
+                # 1. Load Array
+                img_array = np.load(str(full_path)) # shape: [H, W, C]
+                
+                # 2. To Tensor & Permute to [C, H, W]
+                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+                
+                # 3. IMPA Normalization Handling
+                # If data is 0-65535 (16-bit) or 0-255 (8-bit), scale to [0,1]
+                if img_tensor.max() > 1.0:
+                    img_tensor = img_tensor / img_tensor.max()
+                
+                # 4. Scale to [-1, 1] for Diffusion Model
+                img_tensor = (img_tensor - 0.5) * 2.0
+                
+                # 5. Resize to 96x96 if necessary
+                if img_tensor.shape[1] != self.image_size:
+                    img_tensor = F.interpolate(
+                        img_tensor.unsqueeze(0), 
+                        size=(self.image_size, self.image_size), 
+                        mode='bilinear'
+                    ).squeeze(0)
+                    
+                return img_tensor
             except Exception as e:
-                print(f"Warning: Failed to load image {full_path}: {e}")
-        
-        # Fallback: generate synthetic image for testing
-        return self._generate_synthetic_image()
+                print(f"Error loading {full_path}: {e}")
+                return self._generate_synthetic_image()
+        else:
+            # print(f"Missing file: {full_path}") # Uncomment to debug
+            return self._generate_synthetic_image()
     
     def _generate_synthetic_image(self) -> torch.Tensor:
         """Generate synthetic cell-like image for testing."""
@@ -1714,6 +1687,21 @@ class BBBC021AblationRunner:
         print("=" * 80 + "\n")
         self._run_final_benchmarks()
         
+        # [NEW] Generate Interpolation Video
+        print("\n" + "=" * 80)
+        print("GENERATING VISUALIZATIONS")
+        print("=" * 80)
+        
+        # Generate interpolation using the best model found
+        # Reloading best model for visualization
+        best_model_path = os.path.join(self.models_dir, f'PPO_config_0_final.pt') # Load first config or logic to find best
+        if os.path.exists(best_model_path):
+            viz_model = self._create_conditional_ddpm(pretrain_ddpm) # Re-init architecture
+            viz_model.load(best_model_path)
+            self.generate_interpolation(viz_model, start_compound='DMSO', end_compound='Taxol')
+        else:
+            print("Warning: Best model not found. Skipping interpolation visualization.")
+        
         total_time = time.time() - start_time
         print(f"\nTotal time: {total_time / 3600:.2f} hours")
         print(f"Results saved to: {self.output_dir}")
@@ -2869,6 +2857,70 @@ Learned Statistics:
         
         print(f"  Latent space visualization saved to: {plot_path}")
 
+    def generate_interpolation(self, model, start_compound='DMSO', end_compound='Taxol', steps=8):
+        """
+        Generates a latent interpolation video/plot between two compounds.
+        """
+        print(f"\n[Viz] Generating interpolation: {start_compound} -> {end_compound}")
+        model.model.eval()
+        
+        # 1. Get SMILES strings from metadata
+        start_smiles = None
+        end_smiles = None
+        for m in self.train_dataset.metadata:
+            if m['compound'] == start_compound and m.get('smiles'):
+                start_smiles = m['smiles']
+            if m['compound'] == end_compound and m.get('smiles'):
+                end_smiles = m['smiles']
+        
+        # Fallback: use compound name if SMILES not found (for DMSO, etc.)
+        if not start_smiles:
+            start_smiles = start_compound
+        if not end_smiles:
+            end_smiles = end_compound
+        
+        # Get Latent Vectors (Fingerprints)
+        fp_start = torch.tensor(self.train_dataset.morgan_encoder.encode(start_smiles)).to(self.config.device)
+        fp_end = torch.tensor(self.train_dataset.morgan_encoder.encode(end_smiles)).to(self.config.device)
+        
+        # 2. Get a real control image (Source)
+        # Find first start_compound image in validation set
+        ctrl_indices = [i for i, m in enumerate(self.val_dataset.metadata) if m['compound'] == start_compound]
+        if not ctrl_indices: 
+            print(f"Warning: Could not find {start_compound} in validation set. Skipping interpolation.")
+            return # Skip if not found
+        
+        control_img = self.val_dataset[ctrl_indices[0]]['image'].unsqueeze(0).to(self.config.device)
+        
+        # 3. Interpolate and Generate
+        interpolation_grid = []
+        with torch.no_grad():
+            for alpha in np.linspace(0, 1, steps):
+                # Linear Interpolation in Latent Space (slerp is better, but lerp works for binary FPs)
+                fp_interp = (1 - alpha) * fp_start + alpha * fp_end
+                
+                # Sample with the mixed embedding
+                gen = model.sample(1, control_img, fp_interp.unsqueeze(0), num_steps=50)
+                
+                # Post-process for display ([-1, 1] -> [0, 1])
+                img = gen.squeeze().cpu().permute(1, 2, 0).numpy()
+                img = (img + 1.0) / 2.0
+                img = np.clip(img, 0, 1)
+                interpolation_grid.append(img)
+
+        # 4. Save Plot
+        fig, axes = plt.subplots(1, steps, figsize=(20, 3))
+        for i, ax in enumerate(axes):
+            ax.imshow(interpolation_grid[i])
+            ax.axis('off')
+            if i == 0: ax.set_title(start_compound, fontsize=10)
+            if i == steps - 1: ax.set_title(end_compound, fontsize=10)
+            
+        save_path = os.path.join(self.plots_dir, f"interp_{start_compound}_to_{end_compound}.png")
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Interpolation saved to {save_path}")
+
 
 # ============================================================================
 # MAIN
@@ -2881,9 +2933,9 @@ def main():
     )
     
     # Data
-    parser.add_argument("--data-dir", type=str, default="./data/bbbc021",
+    parser.add_argument("--data-dir", type=str, default="./data/bbbc021_all",
                        help="Directory containing BBBC021 data")
-    parser.add_argument("--metadata-file", type=str, default="metadata.csv",
+    parser.add_argument("--metadata-file", type=str, default="metadata/bbbc021_df_all.csv",
                        help="Metadata CSV file")
     
     # Training
