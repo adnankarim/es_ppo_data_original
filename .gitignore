@@ -1,7 +1,7 @@
 # All folders starting with .
 .*/
 
-
+data
 # Python cache and compiled files
 __pycache__/
 *.py[cod]

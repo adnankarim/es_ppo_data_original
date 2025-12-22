@@ -98,8 +98,8 @@ class BBBC021Config:
     
     # Data paths
     # For IMPA dataset on Windows, use: r"C:\Users\dell\Downloads\IMPA_reproducibility\IMPA_reproducibility\datasets\bbbc021_all\bbbc021_all"
-    data_dir: str = "./data/bbbc021"  # Directory containing BBBC021 data (supports nested .npy files)
-    metadata_file: str = "metadata.csv"  # Metadata CSV file (or "metadata/bbbc021_df_all.csv" for IMPA)
+    data_dir: str = "./data/bbbc021_all"  # Directory containing BBBC021 data (supports nested .npy files)
+    metadata_file: str = "metadata/bbbc021_df_all.csv"  # Metadata CSV file (or "metadata/bbbc021_df_all.csv" for IMPA)
     
     # Image settings
     image_size: int = 96
