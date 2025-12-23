@@ -32,6 +32,7 @@ import time
 import shutil
 import itertools
 import math
+import glob
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
@@ -96,10 +97,22 @@ except ImportError:
 class BBBC021Config:
     """Configuration for BBBC021 ablation study."""
     
+    # Experiment Mode
+    mode: str = "ablation"  # "ablation" or "single"
+    method: str = "PPO"     # "ES" or "PPO" (for single mode)
+    
+    # Resume / IDs
+    resume_exp_id: Optional[str] = None  # If set, resume this specific run folder
+    resume_pretrain: bool = False        # If True, continue training the global base model
+    
     # Data paths
     # For IMPA dataset on Windows, use: r"C:\Users\dell\Downloads\IMPA_reproducibility\IMPA_reproducibility\datasets\bbbc021_all\bbbc021_all"
     data_dir: str = "./data/bbbc021_all"  # Directory containing BBBC021 data (supports nested .npy files)
     metadata_file: str = "metadata/bbbc021_df_all.csv"  # Metadata CSV file (or "metadata/bbbc021_df_all.csv" for IMPA)
+    
+    # Global Model Management
+    global_model_dir: str = "./global_pretrained_models"
+    force_pretrain: bool = False  # Ignore global model, train local fresh
     
     # Image settings
     image_size: int = 96
@@ -134,6 +147,13 @@ class BBBC021Config:
     ppo_clip_values: List[float] = field(default_factory=lambda: [0.05, 0.1, 0.2])
     ppo_lr_values: List[float] = field(default_factory=lambda: [2e-5, 5e-5, 1e-4])
     
+    # --- Single Config Params (Used if mode='single') ---
+    single_es_sigma: float = 0.005
+    single_es_lr: float = 0.0005
+    single_ppo_kl: float = 0.5
+    single_ppo_clip: float = 0.1
+    single_ppo_lr: float = 5e-5
+    
     # U-Net architecture
     unet_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
     time_embed_dim: int = 256
@@ -158,6 +178,10 @@ class BBBC021Config:
     # Memory optimization
     gradient_checkpointing: bool = True
     mixed_precision: bool = True
+    
+    # Optimization
+    num_workers: int = 32 if os.name != 'nt' else 0
+    pin_memory: bool = True
 
 
 # ============================================================================
@@ -1711,9 +1735,21 @@ class BBBC021AblationRunner:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(config.seed)
         
-        # Create directories
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.output_dir = os.path.join(config.output_dir, f"run_{timestamp}")
+        # 1. Handle Run Directory & Resume
+        if config.resume_exp_id:
+            # Look for existing directory
+            candidates = glob.glob(os.path.join(config.output_dir, f"run_{config.resume_exp_id}*"))
+            if not candidates:
+                raise ValueError(f"Could not find experiment to resume with ID: {config.resume_exp_id}")
+            self.output_dir = candidates[0]
+            print(f"RESUMING Experiment from: {self.output_dir}")
+        else:
+            # Create new directory
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_dir = os.path.join(config.output_dir, f"run_{timestamp}_{config.mode}")
+            os.makedirs(self.output_dir, exist_ok=True)
+            print(f"STARTING New Experiment at: {self.output_dir}")
+        
         self.models_dir = os.path.join(self.output_dir, "models")
         self.plots_dir = os.path.join(self.output_dir, "plots")
         self.logs_dir = os.path.join(self.output_dir, "logs")
@@ -1725,6 +1761,9 @@ class BBBC021AblationRunner:
         # Pretrained models directory
         self.pretrained_dir = os.path.join(config.output_dir, "pretrained_models")
         os.makedirs(self.pretrained_dir, exist_ok=True)
+        
+        # Global model directory
+        os.makedirs(config.global_model_dir, exist_ok=True)
         
         # Load dataset
         print("Loading BBBC021 dataset...")
@@ -1739,9 +1778,21 @@ class BBBC021AblationRunner:
         
         # Initialize wandb
         if config.use_wandb and WANDB_AVAILABLE:
+            if config.resume_exp_id:
+                run_id = config.resume_exp_id
+                resume_mode = "allow"
+            else:
+                # Generate a unique ID
+                try:
+                    run_id = wandb.util.generate_id()
+                except:
+                    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                resume_mode = None
             wandb.init(
                 project=config.wandb_project,
-                name=f"bbbc021_ablation_{timestamp}",
+                id=run_id,
+                resume=resume_mode,
+                name=f"bbbc021_{config.mode}_{run_id}",
                 config=asdict(config)
             )
         
@@ -1753,10 +1804,60 @@ class BBBC021AblationRunner:
         print(f"Train samples: {len(self.train_dataset)}")
         print(f"Val samples: {len(self.val_dataset)}")
     
+    def _load_checkpoint_if_exists(self, model, optimizer, filename):
+        """Attempts to load a checkpoint. Returns epoch number."""
+        # Check global first for pretraining
+        if "pretrain" in filename and not self.config.force_pretrain:
+            global_path = os.path.join(self.config.global_model_dir, "ddpm_base_latest.pt")
+            if os.path.exists(global_path):
+                print(f"Loading GLOBAL pretrain checkpoint: {global_path}")
+                ckpt = torch.load(global_path, map_location=self.config.device)
+                model.model.load_state_dict(ckpt['model_state_dict'])
+                # Only load optimizer if we are RESUMING pretraining
+                if self.config.resume_pretrain and optimizer and 'optimizer_state_dict' in ckpt:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                    return ckpt.get('epoch', 0)
+                # If not resuming, check if model is complete
+                if ckpt.get('epoch', 0) >= self.config.ddpm_epochs:
+                    return self.config.ddpm_epochs  # Return max epochs so we skip training
+                return 0  # Model exists but incomplete, will train from start
+
+        # Check local run dir
+        local_path = os.path.join(self.models_dir, filename)
+        if os.path.exists(local_path):
+            print(f"Loading LOCAL checkpoint: {local_path}")
+            ckpt = torch.load(local_path, map_location=self.config.device)
+            model.model.load_state_dict(ckpt['model_state_dict'])
+            if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            return ckpt.get('epoch', 0)
+        
+        return 0
+
+    def _save_checkpoint(self, model, optimizer, epoch, filename, is_global=False):
+        """Save checkpoint for model and optimizer."""
+        state = {
+            'epoch': epoch,
+            'model_state_dict': model.model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict() if optimizer else None
+        }
+        if model.perturbation_encoder:
+            state['perturbation_encoder_state_dict'] = model.perturbation_encoder.state_dict()
+            
+        # Save to local run
+        torch.save(state, os.path.join(self.models_dir, filename))
+        
+        # Save to global if applicable
+        if is_global:
+            torch.save(state, os.path.join(self.config.global_model_dir, "ddpm_base_latest.pt"))
+    
     def run(self):
-        """Run the ablation study."""
+        """Run the ablation study or single experiment."""
         print("\n" + "=" * 80)
-        print("BBBC021 ABLATION STUDY: ES vs PPO")
+        if self.config.mode == "ablation":
+            print("BBBC021 ABLATION STUDY: ES vs PPO")
+        else:
+            print(f"BBBC021 SINGLE EXPERIMENT: {self.config.method}")
         print("=" * 80 + "\n")
         
         start_time = time.time()
@@ -1765,42 +1866,65 @@ class BBBC021AblationRunner:
         print("Step 1: Pretraining unconditional DDPM on control images...")
         pretrain_ddpm = self._pretrain_ddpm()
         
-        # Step 2: ES Ablations
-        print("\nStep 2: ES Ablations...")
-        es_configs = list(itertools.product(
-            self.config.es_sigma_values,
-            self.config.es_lr_values
-        ))
+        # Step 2: Run experiments based on mode
+        if self.config.mode == "ablation":
+            # Step 2: ES Ablations
+            print("\nStep 2: ES Ablations...")
+            es_configs = list(itertools.product(
+                self.config.es_sigma_values,
+                self.config.es_lr_values
+            ))
+            
+            for i, (sigma, lr) in enumerate(es_configs):
+                print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
+                result = self._run_es_experiment(pretrain_ddpm, sigma, lr, i)
+                self.all_results['ES'].append(result)
+            
+            # Step 3: PPO Ablations
+            print("\nStep 3: PPO Ablations...")
+            ppo_configs = list(itertools.product(
+                self.config.ppo_kl_weight_values,
+                self.config.ppo_clip_values,
+                self.config.ppo_lr_values
+            ))
+            
+            for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
+                print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
+                result = self._run_ppo_experiment(pretrain_ddpm, kl_weight, ppo_clip, lr, i)
+                self.all_results['PPO'].append(result)
+        else:
+            # Single experiment mode
+            print(f"\nStep 2: Running Single {self.config.method} Experiment...")
+            if self.config.method == "PPO":
+                result = self._run_ppo_experiment(
+                    pretrain_ddpm, 
+                    self.config.single_ppo_kl,
+                    self.config.single_ppo_clip,
+                    self.config.single_ppo_lr,
+                    0  # config_idx
+                )
+                self.all_results['PPO'].append(result)
+            elif self.config.method == "ES":
+                result = self._run_es_experiment(
+                    pretrain_ddpm,
+                    self.config.single_es_sigma,
+                    self.config.single_es_lr,
+                    0  # config_idx
+                )
+                self.all_results['ES'].append(result)
         
-        for i, (sigma, lr) in enumerate(es_configs):
-            print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
-            result = self._run_es_experiment(pretrain_ddpm, sigma, lr, i)
-            self.all_results['ES'].append(result)
-        
-        # Step 3: PPO Ablations
-        print("\nStep 3: PPO Ablations...")
-        ppo_configs = list(itertools.product(
-            self.config.ppo_kl_weight_values,
-            self.config.ppo_clip_values,
-            self.config.ppo_lr_values
-        ))
-        
-        for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
-            print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
-            result = self._run_ppo_experiment(pretrain_ddpm, kl_weight, ppo_clip, lr, i)
-            self.all_results['PPO'].append(result)
-        
-        # Generate summary
-        print("\n" + "=" * 80)
-        print("GENERATING SUMMARY")
-        print("=" * 80 + "\n")
-        self._generate_summary()
-        
-        # Run NSCB benchmark on best models
-        print("\n" + "=" * 80)
-        print("RUNNING NSCB BENCHMARK (Final Results)")
-        print("=" * 80 + "\n")
-        self._run_final_benchmarks()
+        # Generate summary (only for ablation mode)
+        if self.config.mode == "ablation":
+            print("\n" + "=" * 80)
+            print("GENERATING SUMMARY")
+            print("=" * 80 + "\n")
+            self._generate_summary()
+            
+            # Run NSCB benchmark on best models
+            print("\n" + "=" * 80)
+            print("RUNNING NSCB BENCHMARK (Final Results)")
+            print("=" * 80 + "\n")
+            self._run_final_benchmarks()
         
         # [NEW] Generate Interpolation Video
         print("\n" + "=" * 80)
@@ -1808,8 +1932,12 @@ class BBBC021AblationRunner:
         print("=" * 80)
         
         # Generate interpolation using the best model found
-        # Reloading best model for visualization
-        best_model_path = os.path.join(self.models_dir, f'PPO_config_0_final.pt') # Load first config or logic to find best
+        if self.config.mode == "ablation":
+            best_model_path = os.path.join(self.models_dir, f'PPO_config_0_final.pt')
+        else:
+            # Single mode: use method-specific model
+            best_model_path = os.path.join(self.models_dir, f'{self.config.method}_config_0_final.pt')
+        
         if os.path.exists(best_model_path):
             viz_model = self._create_conditional_ddpm(pretrain_ddpm) # Re-init architecture
             viz_model.load(best_model_path)
@@ -1844,8 +1972,6 @@ class BBBC021AblationRunner:
     
     def _pretrain_ddpm(self) -> ImageDDPM:
         """Pretrain unconditional DDPM on control images."""
-        model_path = os.path.join(self.pretrained_dir, "ddpm_pretrained.pt")
-        
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
@@ -1857,12 +1983,17 @@ class BBBC021AblationRunner:
             conditional=False,
         )
         
-        if self.config.reuse_pretrained and os.path.exists(model_path):
-            print(f"  Loading pretrained model from {model_path}")
-            ddpm.load(model_path)
+        # Try to load checkpoint
+        start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt")
+        
+        if start_epoch >= self.config.ddpm_epochs:
+            print(f"  Pretrained model already complete (epoch {start_epoch}). Skipping training.")
             return ddpm
         
-        print(f"  Training unconditional DDPM for {self.config.ddpm_epochs} epochs...")
+        if start_epoch > 0:
+            print(f"  Resuming pretraining from epoch {start_epoch}/{self.config.ddpm_epochs}...")
+        else:
+            print(f"  Training unconditional DDPM for {self.config.ddpm_epochs} epochs...")
         
         # Get control images only
         control_indices = self.train_dataset.get_control_indices()
@@ -1884,7 +2015,7 @@ class BBBC021AblationRunner:
         pretrain_plot_dir = os.path.join(self.plots_dir, "pretraining")
         os.makedirs(pretrain_plot_dir, exist_ok=True)
         
-        for epoch in range(self.config.ddpm_epochs):
+        for epoch in range(start_epoch, self.config.ddpm_epochs):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -1914,7 +2045,12 @@ class BBBC021AblationRunner:
             
             if (epoch + 1) % 2 == 0:
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+            
+            # Save checkpoint every epoch
+            self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
         
+        # Final save
+        model_path = os.path.join(self.pretrained_dir, "ddpm_pretrained.pt")
         ddpm.save(model_path)
         print(f"  Saved pretrained model to {model_path}")
         
@@ -3113,9 +3249,23 @@ Learned Statistics:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BBBC021 Ablation Study: ES vs PPO",
+        description="BBBC021 Unified Runner: Ablation & Single Experiment with Resume",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
+    
+    # Mode Selection
+    parser.add_argument("--mode", type=str, default="ablation", choices=["ablation", "single"],
+                       help="Run mode: 'ablation' (loop through params) or 'single' (one config)")
+    parser.add_argument("--method", type=str, default="PPO", choices=["PPO", "ES"],
+                       help="Training method (for single mode)")
+    parser.add_argument("--resume-id", type=str, default=None,
+                       help="Experiment ID to resume (folder name suffix, e.g., '20241223_120000')")
+    
+    # Global Pretrain Flags
+    parser.add_argument("--force-pretrain", action="store_true",
+                       help="Ignore global model, train fresh pretrained model")
+    parser.add_argument("--resume-pretrain", action="store_true",
+                       help="Resume training the global base model")
     
     # Data
     parser.add_argument("--data-dir", type=str, default="./data/bbbc021_all",
@@ -3130,6 +3280,10 @@ def main():
                        help="Coupling training epochs")
     parser.add_argument("--warmup-epochs", type=int, default=10,
                        help="Warmup epochs before ES")
+    parser.add_argument("--ddpm-batch-size", type=int, default=512,
+                       help="DDPM batch size")
+    parser.add_argument("--coupling-batch-size", type=int, default=256,
+                       help="Coupling batch size")
     
     # ES ablation
     parser.add_argument("--es-sigma-values", type=float, nargs='+',
@@ -3150,6 +3304,18 @@ def main():
                        default=[2e-5, 5e-5, 1e-4],
                        help="PPO learning rate values")
     
+    # Single Experiment Params (Only used if mode='single')
+    parser.add_argument("--single-ppo-kl", type=float, default=0.5,
+                       help="PPO KL weight for single experiment")
+    parser.add_argument("--single-ppo-clip", type=float, default=0.1,
+                       help="PPO clip value for single experiment")
+    parser.add_argument("--single-ppo-lr", type=float, default=5e-5,
+                       help="PPO learning rate for single experiment")
+    parser.add_argument("--single-es-sigma", type=float, default=0.005,
+                       help="ES sigma for single experiment")
+    parser.add_argument("--single-es-lr", type=float, default=0.0005,
+                       help="ES learning rate for single experiment")
+    
     # Output
     parser.add_argument("--output-dir", type=str, default="bbbc021_ablation_results",
                        help="Output directory")
@@ -3169,16 +3335,28 @@ def main():
     args = parser.parse_args()
     
     config = BBBC021Config(
+        mode=args.mode,
+        method=args.method,
+        resume_exp_id=args.resume_id,
+        resume_pretrain=args.resume_pretrain,
+        force_pretrain=args.force_pretrain,
         data_dir=args.data_dir,
         metadata_file=args.metadata_file,
         ddpm_epochs=args.ddpm_epochs,
         coupling_epochs=args.coupling_epochs,
         warmup_epochs=args.warmup_epochs,
+        ddpm_batch_size=args.ddpm_batch_size,
+        coupling_batch_size=args.coupling_batch_size,
         es_sigma_values=args.es_sigma_values,
         es_lr_values=args.es_lr_values,
         ppo_kl_weight_values=args.ppo_kl_values,
         ppo_clip_values=args.ppo_clip_values,
         ppo_lr_values=args.ppo_lr_values,
+        single_ppo_kl=args.single_ppo_kl,
+        single_ppo_clip=args.single_ppo_clip,
+        single_ppo_lr=args.single_ppo_lr,
+        single_es_sigma=args.single_es_sigma,
+        single_es_lr=args.single_es_lr,
         output_dir=args.output_dir,
         use_wandb=args.use_wandb,
         seed=args.seed,
