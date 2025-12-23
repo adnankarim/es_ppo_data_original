@@ -111,15 +111,16 @@ class BBBC021Config:
     
     # DDPM pretraining
     ddpm_epochs: int = 100
-    ddpm_lr: float = 1e-4
-    # Increased for speed (requires >8GB VRAM)
-    ddpm_batch_size: int = 64
+    # Updated for 144GB GPU - Linear scaling rule: increased LR slightly for larger batch
+    ddpm_lr: float = 2e-4
+    # Optimized for 144GB GPU (GH200) - Speed Demon config
+    ddpm_batch_size: int = 512
     ddpm_timesteps: int = 1000
     
     # Coupling training
     coupling_epochs: int = 30
-    # Increased for speed (requires >8GB VRAM)
-    coupling_batch_size: int = 32
+    # Optimized for 144GB GPU (GH200) - handles control+perturbed images
+    coupling_batch_size: int = 256
     warmup_epochs: int = 10
     num_sampling_steps: int = 50
     
@@ -622,7 +623,8 @@ class BatchPairedDataLoader:
         self.batch_size = batch_size
         self.shuffle = shuffle
         # Windows compatibility: default to 0 on Windows to avoid frozen process bug
-        self.num_workers = num_workers if num_workers is not None else (0 if os.name == 'nt' else 4)
+        # Optimized for 144GB GPU - increase workers to prevent CPU bottleneck
+        self.num_workers = num_workers if num_workers is not None else (0 if os.name == 'nt' else 32)
         
         # Get perturbed indices
         self.perturbed_indices = dataset.get_perturbed_indices()
@@ -1865,13 +1867,16 @@ class BBBC021AblationRunner:
         # Get control images only
         control_indices = self.train_dataset.get_control_indices()
         control_dataset = Subset(self.train_dataset, control_indices)
+        # Optimized for 144GB GPU - increase workers to prevent CPU bottleneck
         # Windows compatibility: use num_workers=0 to avoid frozen process bug
-        num_workers = 0 if os.name == 'nt' else 4
+        num_workers = 0 if os.name == 'nt' else 32
         dataloader = DataLoader(
             control_dataset,
             batch_size=self.config.ddpm_batch_size,
             shuffle=True,
             num_workers=num_workers,
+            pin_memory=True,  # Faster GPU transfer
+            persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
         )
         
         # Track metrics for plotting
@@ -2228,7 +2233,13 @@ class BBBC021AblationRunner:
         
         # Create test dataset
         test_subset = Subset(self.val_dataset, test_indices)
-        test_loader = DataLoader(test_subset, batch_size=self.config.coupling_batch_size, shuffle=False)
+        test_loader = DataLoader(
+            test_subset, 
+            batch_size=self.config.coupling_batch_size, 
+            shuffle=False,
+            num_workers=16 if os.name != 'nt' else 0,
+            pin_memory=True,
+        )
         
         real_images = []
         fake_images = []
@@ -2376,7 +2387,13 @@ class BBBC021AblationRunner:
         real_images = []
         fake_images = []
         
-        dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=32, 
+            shuffle=False,
+            num_workers=16 if os.name != 'nt' else 0,
+            pin_memory=True,
+        )
         
         with torch.no_grad():
             # Get real images
