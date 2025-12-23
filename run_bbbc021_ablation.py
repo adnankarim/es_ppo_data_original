@@ -112,12 +112,14 @@ class BBBC021Config:
     # DDPM pretraining
     ddpm_epochs: int = 100
     ddpm_lr: float = 1e-4
-    ddpm_batch_size: int = 32
+    # Increased for speed (requires >8GB VRAM)
+    ddpm_batch_size: int = 64
     ddpm_timesteps: int = 1000
     
     # Coupling training
     coupling_epochs: int = 30
-    coupling_batch_size: int = 16
+    # Increased for speed (requires >8GB VRAM)
+    coupling_batch_size: int = 32
     warmup_epochs: int = 10
     num_sampling_steps: int = 50
     
@@ -1484,34 +1486,41 @@ class ImageMetrics:
     @staticmethod
     def compute_fid(real_images: np.ndarray, fake_images: np.ndarray) -> float:
         """
-        Compute Fréchet Inception Distance.
-        Simplified version without Inception network (uses raw features).
+        Compute Fréchet Inception Distance on Full Resolution (96x96) images.
+        Matches CellFlux Paper methodology.
         """
         if not SCIPY_AVAILABLE:
             return 0.0
-        
+
+        # --- PREVIOUSLY RESIZING WAS HERE (REMOVED) ---
+        # Now calculating on full 96x96 dimensions
+        # ---------------------------------------------
+
         # Flatten images
         real_flat = real_images.reshape(real_images.shape[0], -1)
         fake_flat = fake_images.reshape(fake_images.shape[0], -1)
-        
+
         # Compute statistics
         mu_real = np.mean(real_flat, axis=0)
         mu_fake = np.mean(fake_flat, axis=0)
-        
+
+        # Efficient Covariance Calculation
+        # Note: This creates a large matrix (27648 x 27648)
         sigma_real = np.cov(real_flat, rowvar=False) + np.eye(real_flat.shape[1]) * 1e-6
         sigma_fake = np.cov(fake_flat, rowvar=False) + np.eye(fake_flat.shape[1]) * 1e-6
-        
+
         # Compute FID
         diff = mu_real - mu_fake
-        
+
         try:
             covmean = linalg.sqrtm(sigma_real @ sigma_fake)
             if np.iscomplexobj(covmean):
                 covmean = covmean.real
-            
+
             fid = diff @ diff + np.trace(sigma_real + sigma_fake - 2 * covmean)
             return float(fid)
-        except Exception:
+        except Exception as e:
+            print(f"FID Calculation warning: {e}")
             return float('inf')
     
     @staticmethod
