@@ -1877,8 +1877,21 @@ class BBBC021AblationRunner:
             
             for i, (sigma, lr) in enumerate(es_configs):
                 print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
-                result = self._run_es_experiment(pretrain_ddpm, sigma, lr, i)
-                self.all_results['ES'].append(result)
+                # Check if this config is already complete
+                final_path = os.path.join(self.models_dir, f'ES_config_{i}_final.pt')
+                if os.path.exists(final_path) and self.config.resume_exp_id:
+                    print(f"    Config {i} already complete. Skipping.")
+                    # Load and evaluate to get metrics
+                    cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
+                    cond_ddpm.load(final_path)
+                    result = self._evaluate(cond_ddpm)
+                    result['method'] = 'ES'
+                    result['sigma'] = sigma
+                    result['lr'] = lr
+                    self.all_results['ES'].append(result)
+                else:
+                    result = self._run_es_experiment(pretrain_ddpm, sigma, lr, i)
+                    self.all_results['ES'].append(result)
             
             # Step 3: PPO Ablations
             print("\nStep 3: PPO Ablations...")
@@ -1890,8 +1903,22 @@ class BBBC021AblationRunner:
             
             for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
                 print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
-                result = self._run_ppo_experiment(pretrain_ddpm, kl_weight, ppo_clip, lr, i)
-                self.all_results['PPO'].append(result)
+                # Check if this config is already complete
+                final_path = os.path.join(self.models_dir, f'PPO_config_{i}_final.pt')
+                if os.path.exists(final_path) and self.config.resume_exp_id:
+                    print(f"    Config {i} already complete. Skipping.")
+                    # Load and evaluate to get metrics
+                    cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
+                    cond_ddpm.load(final_path)
+                    result = self._evaluate(cond_ddpm)
+                    result['method'] = 'PPO'
+                    result['kl_weight'] = kl_weight
+                    result['ppo_clip'] = ppo_clip
+                    result['lr'] = lr
+                    self.all_results['PPO'].append(result)
+                else:
+                    result = self._run_ppo_experiment(pretrain_ddpm, kl_weight, ppo_clip, lr, i)
+                    self.all_results['PPO'].append(result)
         else:
             # Single experiment mode
             print(f"\nStep 2: Running Single {self.config.method} Experiment...")
@@ -2094,8 +2121,29 @@ class BBBC021AblationRunner:
         lr: float,
         config_idx: int,
     ) -> Dict:
-        """Run single ES experiment."""
+        """Run single ES experiment with Resume capability."""
         cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
+        
+        # --- RESUME LOGIC START ---
+        checkpoint_name = f'ES_config_{config_idx}_latest.pt'
+        # ES doesn't have a standard optimizer in the trainer, so we pass None
+        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, None, checkpoint_name)
+        
+        # Check if Warmup is needed or already done
+        run_warmup = True
+        warmup_start_epoch = 0
+        es_start_epoch = 0
+        
+        if start_epoch >= self.config.warmup_epochs:
+            # We are resuming past warmup, skip to ES phase
+            run_warmup = False
+            es_start_epoch = start_epoch - self.config.warmup_epochs
+            print(f"  Resuming ES Config {config_idx} from ES Epoch {es_start_epoch} (warmup already complete)")
+        elif start_epoch > 0:
+            # Resuming during warmup
+            warmup_start_epoch = start_epoch
+            print(f"  Resuming ES Config {config_idx} from Warmup Epoch {warmup_start_epoch}")
+        # --- RESUME LOGIC END ---
         
         # Create dataloader
         dataloader = BatchPairedDataLoader(
@@ -2104,46 +2152,52 @@ class BBBC021AblationRunner:
             shuffle=True,
         )
         
-        # Warmup phase (gradient training)
-        print(f"    Warmup phase: {self.config.warmup_epochs} epochs...")
         warmup_metrics = []
-        for warmup_epoch in range(self.config.warmup_epochs):
-            # Reset peak memory stats at start of epoch
-            if torch.cuda.is_available():
-                torch.cuda.reset_peak_memory_stats()
-            
-            warmup_losses = []
-            for batch in dataloader:
-                control = batch['control'].to(self.config.device)
-                perturbed = batch['perturbed'].to(self.config.device)
-                fingerprint = batch['fingerprint'].to(self.config.device)
+        
+        # --- WARMUP PHASE ---
+        if run_warmup:
+            print(f"    Warmup phase: {warmup_start_epoch} to {self.config.warmup_epochs} epochs...")
+            for warmup_epoch in range(warmup_start_epoch, self.config.warmup_epochs):
+                # Reset peak memory stats at start of epoch
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
                 
-                loss = cond_ddpm.train_step(perturbed, control, fingerprint)
-                warmup_losses.append(loss)
-            
-            avg_loss = np.mean(warmup_losses)
-            
-            # Get GPU stats
-            gpu_stats = self._get_gpu_stats()
-            
-            # Evaluate during warmup
-            metrics = self._evaluate(cond_ddpm)
-            metrics['epoch'] = warmup_epoch + 1
-            metrics['loss'] = avg_loss
-            metrics['sigma'] = sigma
-            metrics['lr'] = lr
-            metrics['phase'] = 'warmup'
-            # Add GPU stats to metrics
-            metrics.update(gpu_stats)
-            warmup_metrics.append(metrics)
-            
-            # Plot during warmup
-            checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            self._plot_checkpoint(warmup_metrics, checkpoint_dir, warmup_epoch, 'ES', f'σ={sigma}, lr={lr}')
-            
-            if (warmup_epoch + 1) % 3 == 0:
-                print(f"      Warmup epoch {warmup_epoch+1}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
+                warmup_losses = []
+                for batch in dataloader:
+                    control = batch['control'].to(self.config.device)
+                    perturbed = batch['perturbed'].to(self.config.device)
+                    fingerprint = batch['fingerprint'].to(self.config.device)
+                    
+                    loss = cond_ddpm.train_step(perturbed, control, fingerprint)
+                    warmup_losses.append(loss)
+                
+                avg_loss = np.mean(warmup_losses)
+                
+                # Get GPU stats
+                gpu_stats = self._get_gpu_stats()
+                
+                # Evaluate during warmup
+                metrics = self._evaluate(cond_ddpm)
+                metrics['epoch'] = warmup_epoch + 1
+                metrics['loss'] = avg_loss
+                metrics['sigma'] = sigma
+                metrics['lr'] = lr
+                metrics['phase'] = 'warmup'
+                # Add GPU stats to metrics
+                metrics.update(gpu_stats)
+                warmup_metrics.append(metrics)
+                
+                # Plot during warmup
+                checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                self._plot_checkpoint(warmup_metrics, checkpoint_dir, warmup_epoch, 'ES', f'σ={sigma}, lr={lr}')
+                
+                if (warmup_epoch + 1) % 3 == 0:
+                    print(f"      Warmup epoch {warmup_epoch+1}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
+                
+                # Save checkpoint during warmup
+                current_epoch = warmup_epoch + 1
+                self._save_checkpoint(cond_ddpm, None, current_epoch, checkpoint_name)
         
         # Initialize epoch_metrics with warmup metrics
         epoch_metrics = warmup_metrics.copy()
@@ -2157,7 +2211,7 @@ class BBBC021AblationRunner:
             device=self.config.device,
         )
         
-        for epoch in range(self.config.coupling_epochs):
+        for epoch in range(es_start_epoch, self.config.coupling_epochs):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -2179,7 +2233,7 @@ class BBBC021AblationRunner:
             
             # Evaluate
             metrics = self._evaluate(cond_ddpm)
-            # Continue epoch numbering from warmup
+            # Continue epoch numbering from warmup (absolute epoch)
             metrics['epoch'] = len(epoch_metrics) + 1
             metrics['loss'] = avg_loss
             metrics['sigma'] = sigma
@@ -2205,8 +2259,13 @@ class BBBC021AblationRunner:
                     f'ES/config_{config_idx}/mse': metrics['mse'],
                     f'ES/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
+            
+            # --- SAVE CHECKPOINT ---
+            # Save "latest" for resuming (absolute epoch includes warmup)
+            current_absolute_epoch = len(epoch_metrics)
+            self._save_checkpoint(cond_ddpm, None, current_absolute_epoch, checkpoint_name)
         
-        final_metrics = epoch_metrics[-1]
+        final_metrics = epoch_metrics[-1] if epoch_metrics else {}
         final_metrics['method'] = 'ES'
         final_metrics['history'] = epoch_metrics
         
@@ -2231,8 +2290,37 @@ class BBBC021AblationRunner:
         lr: float,
         config_idx: int,
     ) -> Dict:
-        """Run single PPO experiment."""
+        """Run single PPO experiment with Resume capability."""
         cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
+        
+        # --- RESUME LOGIC START ---
+        checkpoint_name = f'PPO_config_{config_idx}_latest.pt'
+        # Initialize trainer first (needed for optimizer state)
+        ppo_trainer = ImagePPOTrainer(
+            cond_ddpm,
+            pretrain_ddpm,
+            kl_weight=kl_weight,
+            ppo_clip=ppo_clip,
+            lr=lr,
+            device=self.config.device,
+            use_bio_loss=self.config.enable_bio_loss,
+        )
+        
+        # Check if we have a saved state
+        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, ppo_trainer.optimizer, checkpoint_name)
+        
+        if start_epoch >= self.config.coupling_epochs:
+            print(f"  Config {config_idx} already finished. Loading final model and skipping.")
+            # Load the final model to ensure we return the correct metrics
+            final_name = f'PPO_config_{config_idx}_final.pt'
+            final_path = os.path.join(self.models_dir, final_name)
+            if os.path.exists(final_path):
+                cond_ddpm.load(final_path)
+            return self._evaluate(cond_ddpm)  # Return evaluation of finished model
+            
+        if start_epoch > 0:
+            print(f"  Resuming PPO Config {config_idx} from Epoch {start_epoch}")
+        # --- RESUME LOGIC END ---
         
         # Create dataloader
         dataloader = BatchPairedDataLoader(
@@ -2241,20 +2329,9 @@ class BBBC021AblationRunner:
             shuffle=True,
         )
         
-        # PPO trainer
-        ppo_trainer = ImagePPOTrainer(
-            cond_ddpm,
-            pretrain_ddpm,
-            kl_weight=kl_weight,
-            ppo_clip=ppo_clip,
-            lr=lr,
-            device=self.config.device,
-            use_bio_loss=self.config.enable_bio_loss,  # Pass flag from config
-        )
-        
         epoch_metrics = []
         
-        for epoch in range(self.config.coupling_epochs):
+        for epoch in range(start_epoch, self.config.coupling_epochs):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -2302,8 +2379,12 @@ class BBBC021AblationRunner:
                     f'PPO/config_{config_idx}/mse': metrics['mse'],
                     f'PPO/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
+            
+            # --- SAVE CHECKPOINT ---
+            # Save "latest" for resuming
+            self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name)
         
-        final_metrics = epoch_metrics[-1]
+        final_metrics = epoch_metrics[-1] if epoch_metrics else {}
         final_metrics['method'] = 'PPO'
         final_metrics['history'] = epoch_metrics
         
