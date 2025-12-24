@@ -104,6 +104,7 @@ class BBBC021Config:
     # Resume / IDs
     resume_exp_id: Optional[str] = None  # If set, resume this specific run folder
     resume_pretrain: bool = False        # If True, continue training the global base model
+    skip_optimizer_on_resume: bool = False  # If True, don't load optimizer state (use new LR)
     
     # Data paths
     # For IMPA dataset on Windows, use: r"C:\Users\dell\Downloads\IMPA_reproducibility\IMPA_reproducibility\datasets\bbbc021_all\bbbc021_all"
@@ -124,16 +125,16 @@ class BBBC021Config:
     
     # DDPM pretraining
     ddpm_epochs: int = 100
-    # Updated for 144GB GPU - Linear scaling rule: increased LR slightly for larger batch
-    ddpm_lr: float = 2e-4
-    # Optimized for 144GB GPU (GH200) - Speed Demon config
-    ddpm_batch_size: int = 512
+    # Updated for 144GB GPU - Linear scaling rule: increased LR for larger batch
+    ddpm_lr: float = 3e-4  # Increased from 2e-4 for batch_size=1024
+    # Optimized for 144GB GPU (GH200) - Maximum utilization
+    ddpm_batch_size: int = 1024  # Increased from 512
     ddpm_timesteps: int = 1000
     
     # Coupling training
     coupling_epochs: int = 30
     # Optimized for 144GB GPU (GH200) - handles control+perturbed images
-    coupling_batch_size: int = 256
+    coupling_batch_size: int = 512  # Increased from 256
     warmup_epochs: int = 10
     num_sampling_steps: int = 50
     
@@ -150,9 +151,9 @@ class BBBC021Config:
     # --- Single Config Params (Used if mode='single') ---
     single_es_sigma: float = 0.005
     single_es_lr: float = 0.0005
-    single_ppo_kl: float = 0.5
-    single_ppo_clip: float = 0.1
-    single_ppo_lr: float = 5e-5
+    single_ppo_kl: float = 0.4  # Lower KL weight for better convergence
+    single_ppo_clip: float = 0.08  # Tighter clip for stability
+    single_ppo_lr: float = 3e-5  # Lower LR for stability and convergence
     
     # U-Net architecture
     unet_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
@@ -1804,8 +1805,15 @@ class BBBC021AblationRunner:
         print(f"Train samples: {len(self.train_dataset)}")
         print(f"Val samples: {len(self.val_dataset)}")
     
-    def _load_checkpoint_if_exists(self, model, optimizer, filename):
-        """Attempts to load a checkpoint. Returns epoch number."""
+    def _load_checkpoint_if_exists(self, model, optimizer, filename, skip_optimizer=False):
+        """Attempts to load a checkpoint. Returns epoch number.
+        
+        Args:
+            model: Model to load weights into
+            optimizer: Optimizer to load state into (optional)
+            filename: Checkpoint filename to load
+            skip_optimizer: If True, don't load optimizer state (useful when changing LR)
+        """
         # Check global first for pretraining
         if "pretrain" in filename and not self.config.force_pretrain:
             global_path = os.path.join(self.config.global_model_dir, "ddpm_base_latest.pt")
@@ -1813,10 +1821,12 @@ class BBBC021AblationRunner:
                 print(f"Loading GLOBAL pretrain checkpoint: {global_path}")
                 ckpt = torch.load(global_path, map_location=self.config.device)
                 model.model.load_state_dict(ckpt['model_state_dict'])
-                # Only load optimizer if we are RESUMING pretraining
-                if self.config.resume_pretrain and optimizer and 'optimizer_state_dict' in ckpt:
+                # Only load optimizer if we are RESUMING pretraining and not skipping
+                if self.config.resume_pretrain and optimizer and 'optimizer_state_dict' in ckpt and not skip_optimizer:
                     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                     return ckpt.get('epoch', 0)
+                elif skip_optimizer:
+                    print("  Note: Skipping optimizer state (new learning rate will be used)")
                 # If not resuming, check if model is complete
                 if ckpt.get('epoch', 0) >= self.config.ddpm_epochs:
                     return self.config.ddpm_epochs  # Return max epochs so we skip training
@@ -1828,8 +1838,10 @@ class BBBC021AblationRunner:
             print(f"Loading LOCAL checkpoint: {local_path}")
             ckpt = torch.load(local_path, map_location=self.config.device)
             model.model.load_state_dict(ckpt['model_state_dict'])
-            if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None:
+            if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None and not skip_optimizer:
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            elif skip_optimizer:
+                print("  Note: Skipping optimizer state (new learning rate will be used)")
             return ckpt.get('epoch', 0)
         
         return 0
@@ -2011,7 +2023,7 @@ class BBBC021AblationRunner:
         )
         
         # Try to load checkpoint
-        start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt")
+        start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
         
         if start_epoch >= self.config.ddpm_epochs:
             print(f"  Pretrained model already complete (epoch {start_epoch}). Skipping training.")
@@ -2127,7 +2139,7 @@ class BBBC021AblationRunner:
         # --- RESUME LOGIC START ---
         checkpoint_name = f'ES_config_{config_idx}_latest.pt'
         # ES doesn't have a standard optimizer in the trainer, so we pass None
-        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, None, checkpoint_name)
+        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, None, checkpoint_name, skip_optimizer=self.config.skip_optimizer_on_resume)
         
         # Check if Warmup is needed or already done
         run_warmup = True
@@ -2307,7 +2319,7 @@ class BBBC021AblationRunner:
         )
         
         # Check if we have a saved state
-        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, ppo_trainer.optimizer, checkpoint_name)
+        start_epoch = self._load_checkpoint_if_exists(cond_ddpm, ppo_trainer.optimizer, checkpoint_name, skip_optimizer=self.config.skip_optimizer_on_resume)
         
         if start_epoch >= self.config.coupling_epochs:
             print(f"  Config {config_idx} already finished. Loading final model and skipping.")
@@ -3347,6 +3359,8 @@ def main():
                        help="Ignore global model, train fresh pretrained model")
     parser.add_argument("--resume-pretrain", action="store_true",
                        help="Resume training the global base model")
+    parser.add_argument("--skip-optimizer", action="store_true",
+                       help="Skip loading optimizer state when resuming (use new learning rate)")
     
     # Data
     parser.add_argument("--data-dir", type=str, default="./data/bbbc021_all",
@@ -3361,9 +3375,11 @@ def main():
                        help="Coupling training epochs")
     parser.add_argument("--warmup-epochs", type=int, default=10,
                        help="Warmup epochs before ES")
-    parser.add_argument("--ddpm-batch-size", type=int, default=512,
+    parser.add_argument("--ddpm-batch-size", type=int, default=1024,
                        help="DDPM batch size")
-    parser.add_argument("--coupling-batch-size", type=int, default=256,
+    parser.add_argument("--ddpm-lr", type=float, default=3e-4,
+                       help="DDPM learning rate")
+    parser.add_argument("--coupling-batch-size", type=int, default=512,
                        help="Coupling batch size")
     
     # ES ablation
@@ -3421,12 +3437,14 @@ def main():
         resume_exp_id=args.resume_id,
         resume_pretrain=args.resume_pretrain,
         force_pretrain=args.force_pretrain,
+        skip_optimizer_on_resume=args.skip_optimizer,
         data_dir=args.data_dir,
         metadata_file=args.metadata_file,
         ddpm_epochs=args.ddpm_epochs,
         coupling_epochs=args.coupling_epochs,
         warmup_epochs=args.warmup_epochs,
         ddpm_batch_size=args.ddpm_batch_size,
+        ddpm_lr=args.ddpm_lr,
         coupling_batch_size=args.coupling_batch_size,
         es_sigma_values=args.es_sigma_values,
         es_lr_values=args.es_lr_values,
