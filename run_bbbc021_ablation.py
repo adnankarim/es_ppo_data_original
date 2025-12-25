@@ -525,44 +525,33 @@ class BBBC021Dataset(Dataset):
     
     def _load_image(self, image_path: str) -> torch.Tensor:
         """
-        Load IMPA-preprocessed 96x96 uint8 crops.
-        Uses GLOBAL SCALING to preserve biological intensity differences.
-        Report Section 3.3: Per-image normalization destroys biological signal.
+        [FIXED] Load IMPA 96x96 crops with Global Scaling.
+        Preserves relative intensity between Control (Dark) and Perturbed (Bright).
         """
-        # Ensure extension
         if not image_path.endswith('.npy'):
             image_path += '.npy'
             
-        # Use pathlib to handle Windows backslashes automatically
         full_path = self.data_dir / image_path
         
         if full_path.exists():
             try:
-                # 1. Load the [96, 96, 3] uint8 array (IMPA preprocessing)
-                img_array = np.load(str(full_path))
+                # 1. Load data (Shape: [96, 96, 3], Type: uint8 0-255)
+                img_array = np.load(str(full_path)) 
                 
-                # 2. Convert to float Tensor and move channels to front: [3, 96, 96]
+                # 2. To Float Tensor & Channel First: [3, 96, 96]
                 img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
                 
-                # 3. GLOBAL SCALING (Critical for IMPA/CellFlux)
-                # Map [0, 255] -> [-1, 1] preserving relative intensity
-                # This ensures bright "Taxol" cells remain brighter than dim "Control" cells
+                # 3. GLOBAL SCALING (The Fix)
+                # Map [0, 255] -> [-1, 1] using fixed constants.
+                # Do NOT use img.min() or img.max() here.
                 img_tensor = (img_tensor / 127.5) - 1.0
                 
-                # 4. Resize to 96x96 if necessary (shouldn't be needed for IMPA data)
-                if img_tensor.shape[1] != self.image_size or img_tensor.shape[2] != self.image_size:
-                    img_tensor = F.interpolate(
-                        img_tensor.unsqueeze(0), 
-                        size=(self.image_size, self.image_size), 
-                        mode='bilinear'
-                    ).squeeze(0)
-                    
                 return img_tensor
+                
             except Exception as e:
                 print(f"Error loading {full_path}: {e}")
                 return self._generate_synthetic_image()
         else:
-            # print(f"Missing file: {full_path}") # Uncomment to debug
             return self._generate_synthetic_image()
     
     def _generate_synthetic_image(self) -> torch.Tensor:
@@ -1621,29 +1610,18 @@ class ApproximateMetrics:
     def _get_bio_features(imgs: np.ndarray) -> np.ndarray:
         """
         Extracts Morphological Profile (Mean Intensity + Std Dev per channel).
-        Input: (N, 3, 96, 96) -> Output: (N, 6)
-        Feature vector: [DNA_µ, Actin_µ, Tubulin_µ, DNA_σ, Actin_σ, Tubulin_σ]
-        
-        Report Section 6.2: Explicitly compute statistics per channel for MoA classification.
-        
-        Args:
-            imgs: Images of shape (N, C, H, W) where C=3 (DNA, Actin, Tubulin)
-        
-        Returns:
-            Biological features of shape (N, 6)
+        Output: [DNA_µ, Actin_µ, Tubulin_µ, DNA_σ, Actin_σ, Tubulin_σ]
         """
         # Ensure input is (N, C, H, W)
         if imgs.ndim == 3:
             imgs = imgs[np.newaxis, ...]
-        if len(imgs.shape) != 4:
-            return np.zeros((1, 6)) if imgs.shape[0] == 0 else np.zeros((imgs.shape[0], 6))
-        
+            
         # Calculate Mean and Std along spatial dimensions (axis 2 and 3)
-        # Shape: (N, 3) for both means and stds
+        # This collapses 96x96 into single values per channel
         means = np.mean(imgs, axis=(2, 3))  # Shape (N, 3)
         stds = np.std(imgs, axis=(2, 3))    # Shape (N, 3)
         
-        # Concatenate into a 6D vector per image
+        # Concatenate 
         return np.hstack([means, stds])
 
     @staticmethod
@@ -2021,14 +1999,10 @@ class BBBC021AblationRunner:
     
     def _pretrain_ddpm(self) -> ImageDDPM:
         """
-        Stage 2: Conditional Marginal Pretraining.
-        Implements Report Section 4: "Train a conditional model to learn P(x) and P(y)."
-        
-        CRITICAL: Must train on FULL dataset with conditioning enabled.
-        The model learns the distribution of both Healthy and Perturbed cells,
-        conditioned on the drug embedding, BEFORE attempting to couple them.
+        [FIXED] Stage 2: Conditional Marginal Pretraining.
+        Trains P(x|condition) on both Control AND Perturbed data.
         """
-        # 1. Initialize Conditional Model (NOT unconditional)
+        # 1. Initialize Conditional Model (Changed from False to True)
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
@@ -2037,88 +2011,79 @@ class BBBC021AblationRunner:
             time_emb_dim=self.config.time_embed_dim,
             lr=self.config.ddpm_lr,
             device=self.config.device,
-            conditional=True,  # <--- CRITICAL CHANGE: Must be True for marginal pretraining
+            conditional=True,  # <--- CRITICAL: Must be True
             cond_emb_dim=self.config.perturbation_embed_dim,
         )
         
         # Try to load checkpoint
         start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
-        
         if start_epoch >= self.config.ddpm_epochs:
             print(f"  Pretrained model already complete (epoch {start_epoch}). Skipping training.")
             return ddpm
-        
-        if start_epoch > 0:
-            print(f"  Resuming conditional marginal pretraining from epoch {start_epoch}/{self.config.ddpm_epochs}...")
-        else:
-            print(f"  Training Conditional DDPM (Marginals) on FULL dataset for {self.config.ddpm_epochs} epochs...")
-        
-        # 2. Use Full Dataset (Not just controls)
-        # We need images AND their associated drug fingerprints
-        num_workers = 0 if os.name == 'nt' else 32
+
+        print(f"  Training Conditional DDPM (Marginals) on FULL dataset...")
+
+        # 2. Use Full Dataset (Changed from Control Subset)
+        # Paired loader gives us easy access to fingerprints
+        num_workers = 0 if os.name == 'nt' else self.config.num_workers
         dataloader = DataLoader(
-            self.train_dataset,  # Use FULL dataset
+            self.train_dataset,  # Use everything
             batch_size=self.config.ddpm_batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,  # Faster GPU transfer
-            persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False,
         )
-        
+
         # Track metrics for plotting
         pretrain_metrics = []
         pretrain_plot_dir = os.path.join(self.plots_dir, "pretraining")
         os.makedirs(pretrain_plot_dir, exist_ok=True)
-        
+
         for epoch in range(start_epoch, self.config.ddpm_epochs):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
             
             epoch_losses = []
-            for batch_idx, batch in enumerate(dataloader):
+            
+            for batch in dataloader:
+                # Get data
                 images = batch['image'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
-                # Diagnostic check: verify image normalization on first batch of first epoch
-                if epoch == start_epoch and batch_idx == 0:
-                    img_min, img_max = images.min().item(), images.max().item()
-                    img_mean, img_std = images.mean().item(), images.std().item()
-                    print(f"    [DIAGNOSTIC] Image stats - Min: {img_min:.3f}, Max: {img_max:.3f}, Mean: {img_mean:.3f}, Std: {img_std:.3f}")
-                    if not (-1.01 <= img_min and img_max <= 1.01):
-                        print(f"    [WARNING] Images not in [-1, 1] range! This will cause training to stall.")
-                
-                # 3. Conditional Training Step
-                # We condition on the drug to learn "What does Taxol look like?"
-                # For the 'control' input channel, we pass zeros during pretraining
-                # because we aren't doing style transfer yet, just learning densities.
+                # 3. Train with Conditioning
+                # We feed the drug fingerprint so the model learns: 
+                # "Fingerprint X corresponds to Morphology Y"
+                # We pass zeros for the 'control' image input because in pretraining 
+                # we are learning to generate from noise, not translate yet.
                 dummy_control = torch.zeros_like(images)
                 
                 loss = ddpm.train_step(
-                    x0=images,
-                    control=dummy_control,
+                    x0=images, 
+                    control=dummy_control, 
                     fingerprint=fingerprint
                 )
                 epoch_losses.append(loss)
-            
+                
+            # Keep existing logging/saving logic
             avg_loss = np.mean(epoch_losses)
             
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            # Evaluate and track metrics (use full dataset for evaluation)
+            # Evaluate and track metrics
             metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['phase'] = 'pretraining'
-            # Add GPU stats to metrics
             metrics.update(gpu_stats)
             pretrain_metrics.append(metrics)
             
             # Plot every epoch
             self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'Conditional DDPM Marginal Pretraining')
             
-            if (epoch + 1) % 2 == 0:
+            if (epoch + 1) % 5 == 0:
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             
             # Save checkpoint every epoch
@@ -2128,7 +2093,7 @@ class BBBC021AblationRunner:
         model_path = os.path.join(self.pretrained_dir, "ddpm_pretrained.pt")
         ddpm.save(model_path)
         print(f"  Saved pretrained model to {model_path}")
-        
+            
         return ddpm
     
     def _create_conditional_ddpm(self, pretrain_ddpm: ImageDDPM) -> ImageDDPM:
