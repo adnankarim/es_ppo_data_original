@@ -124,11 +124,11 @@ class BBBC021Config:
     perturbation_embed_dim: int = 256
     
     # DDPM pretraining
-    ddpm_epochs: int = 100
-    # Updated for 144GB GPU - Linear scaling rule: increased LR for larger batch
-    ddpm_lr: float = 3e-4  # Increased from 2e-4 for batch_size=1024
-    # Optimized for 144GB GPU (GH200) - Maximum utilization
-    ddpm_batch_size: int = 1024  # Increased from 512
+    ddpm_epochs: int = 500  # Increased from 100 - DDPMs need more epochs to converge (FID < 200)
+    # Reduced LR for better convergence on stalling models
+    ddpm_lr: float = 1e-4  # Reduced from 3e-4 - prevents "bouncing" around local minima
+    # Reduced batch size for better gradient stability (can use grad_accumulation if needed)
+    ddpm_batch_size: int = 512  # Reduced from 1024 - better gradient stability
     ddpm_timesteps: int = 1000
     
     # Coupling training
@@ -541,13 +541,26 @@ class BBBC021Dataset(Dataset):
                 # 2. To Tensor & Permute to [C, H, W]
                 img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
                 
-                # 3. IMPA Normalization Handling
-                # If data is 0-65535 (16-bit) or 0-255 (8-bit), scale to [0,1]
-                if img_tensor.max() > 1.0:
-                    img_tensor = img_tensor / img_tensor.max()
+                # 3. IMPA Normalization Handling - ROBUST VERSION
+                # Handle any input range: 16-bit (0-65535), 8-bit (0-255), or already normalized
+                img_min = img_tensor.min()
+                img_max = img_tensor.max()
                 
-                # 4. Scale to [-1, 1] for Diffusion Model
+                # Normalize to [0, 1] range (CRITICAL: handles negative values and any range)
+                if img_max > img_min:
+                    img_tensor = (img_tensor - img_min) / (img_max - img_min + 1e-8)
+                else:
+                    # Edge case: constant image
+                    img_tensor = torch.zeros_like(img_tensor)
+                
+                # 4. Scale to [-1, 1] for Diffusion Model (CRITICAL for DDPM convergence)
+                # DDPM noise schedule assumes data is in [-1, 1] range
                 img_tensor = (img_tensor - 0.5) * 2.0
+                
+                # 5. Sanity check: verify normalization (will catch bugs early)
+                if not (img_tensor.min() >= -1.01 and img_tensor.max() <= 1.01):
+                    print(f"WARNING: Normalization out of range: [{img_tensor.min():.3f}, {img_tensor.max():.3f}]")
+                    img_tensor = torch.clamp(img_tensor, -1.0, 1.0)
                 
                 # 5. Resize to 96x96 if necessary
                 if img_tensor.shape[1] != self.image_size:
@@ -2060,8 +2073,17 @@ class BBBC021AblationRunner:
                 torch.cuda.reset_peak_memory_stats()
             
             epoch_losses = []
-            for batch in dataloader:
+            for batch_idx, batch in enumerate(dataloader):
                 images = batch['image'].to(self.config.device)
+                
+                # Diagnostic check: verify image normalization on first batch of first epoch
+                if epoch == start_epoch and batch_idx == 0:
+                    img_min, img_max = images.min().item(), images.max().item()
+                    img_mean, img_std = images.mean().item(), images.std().item()
+                    print(f"    [DIAGNOSTIC] Image stats - Min: {img_min:.3f}, Max: {img_max:.3f}, Mean: {img_mean:.3f}, Std: {img_std:.3f}")
+                    if not (-1.01 <= img_min and img_max <= 1.01):
+                        print(f"    [WARNING] Images not in [-1, 1] range! This will cause training to stall.")
+                    
                 loss = ddpm.train_step(images)
                 epoch_losses.append(loss)
             
@@ -3369,16 +3391,16 @@ def main():
                        help="Metadata CSV file")
     
     # Training
-    parser.add_argument("--ddpm-epochs", type=int, default=100,
-                       help="DDPM pretraining epochs")
+    parser.add_argument("--ddpm-epochs", type=int, default=500,
+                       help="DDPM pretraining epochs (recommended: 500-1000 for convergence)")
     parser.add_argument("--coupling-epochs", type=int, default=30,
                        help="Coupling training epochs")
     parser.add_argument("--warmup-epochs", type=int, default=10,
                        help="Warmup epochs before ES")
-    parser.add_argument("--ddpm-batch-size", type=int, default=1024,
-                       help="DDPM batch size")
-    parser.add_argument("--ddpm-lr", type=float, default=3e-4,
-                       help="DDPM learning rate")
+    parser.add_argument("--ddpm-batch-size", type=int, default=512,
+                       help="DDPM batch size (reduced for gradient stability)")
+    parser.add_argument("--ddpm-lr", type=float, default=1e-4,
+                       help="DDPM learning rate (reduced for better convergence)")
     parser.add_argument("--coupling-batch-size", type=int, default=512,
                        help="Coupling batch size")
     
