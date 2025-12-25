@@ -156,7 +156,8 @@ class BBBC021Config:
     single_ppo_lr: float = 3e-5  # Lower LR for stability and convergence
     
     # U-Net architecture
-    unet_channels: List[int] = field(default_factory=lambda: [64, 128, 256, 512])
+    # Pixel-Space Settings: 96x96 needs significant depth (Report Section 1.3)
+    unet_channels: List[int] = field(default_factory=lambda: [128, 256, 512, 512])
     time_embed_dim: int = 256
     
     # Output
@@ -524,7 +525,9 @@ class BBBC021Dataset(Dataset):
     
     def _load_image(self, image_path: str) -> torch.Tensor:
         """
-        Load 16-bit NumPy array from IMPA dataset and normalize for DDPM.
+        Load IMPA-preprocessed 96x96 uint8 crops.
+        Uses GLOBAL SCALING to preserve biological intensity differences.
+        Report Section 3.3: Per-image normalization destroys biological signal.
         """
         # Ensure extension
         if not image_path.endswith('.npy'):
@@ -535,35 +538,19 @@ class BBBC021Dataset(Dataset):
         
         if full_path.exists():
             try:
-                # 1. Load Array
-                img_array = np.load(str(full_path)) # shape: [H, W, C]
+                # 1. Load the [96, 96, 3] uint8 array (IMPA preprocessing)
+                img_array = np.load(str(full_path))
                 
-                # 2. To Tensor & Permute to [C, H, W]
+                # 2. Convert to float Tensor and move channels to front: [3, 96, 96]
                 img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
                 
-                # 3. IMPA Normalization Handling - ROBUST VERSION
-                # Handle any input range: 16-bit (0-65535), 8-bit (0-255), or already normalized
-                img_min = img_tensor.min()
-                img_max = img_tensor.max()
+                # 3. GLOBAL SCALING (Critical for IMPA/CellFlux)
+                # Map [0, 255] -> [-1, 1] preserving relative intensity
+                # This ensures bright "Taxol" cells remain brighter than dim "Control" cells
+                img_tensor = (img_tensor / 127.5) - 1.0
                 
-                # Normalize to [0, 1] range (CRITICAL: handles negative values and any range)
-                if img_max > img_min:
-                    img_tensor = (img_tensor - img_min) / (img_max - img_min + 1e-8)
-                else:
-                    # Edge case: constant image
-                    img_tensor = torch.zeros_like(img_tensor)
-                
-                # 4. Scale to [-1, 1] for Diffusion Model (CRITICAL for DDPM convergence)
-                # DDPM noise schedule assumes data is in [-1, 1] range
-                img_tensor = (img_tensor - 0.5) * 2.0
-                
-                # 5. Sanity check: verify normalization (will catch bugs early)
-                if not (img_tensor.min() >= -1.01 and img_tensor.max() <= 1.01):
-                    print(f"WARNING: Normalization out of range: [{img_tensor.min():.3f}, {img_tensor.max():.3f}]")
-                    img_tensor = torch.clamp(img_tensor, -1.0, 1.0)
-                
-                # 5. Resize to 96x96 if necessary
-                if img_tensor.shape[1] != self.image_size:
+                # 4. Resize to 96x96 if necessary (shouldn't be needed for IMPA data)
+                if img_tensor.shape[1] != self.image_size or img_tensor.shape[2] != self.image_size:
                     img_tensor = F.interpolate(
                         img_tensor.unsqueeze(0), 
                         size=(self.image_size, self.image_size), 
@@ -1633,8 +1620,11 @@ class ApproximateMetrics:
     @staticmethod
     def _get_bio_features(imgs: np.ndarray) -> np.ndarray:
         """
-        Extracts a simple morphological profile (Mean Intensity + Contrast per channel).
-        Shape: [N, 6] -> [Mean_DNA, Mean_Actin, Mean_Tubulin, Std_DNA, Std_Actin, Std_Tubulin]
+        Extracts Morphological Profile (Mean Intensity + Std Dev per channel).
+        Input: (N, 3, 96, 96) -> Output: (N, 6)
+        Feature vector: [DNA_µ, Actin_µ, Tubulin_µ, DNA_σ, Actin_σ, Tubulin_σ]
+        
+        Report Section 6.2: Explicitly compute statistics per channel for MoA classification.
         
         Args:
             imgs: Images of shape (N, C, H, W) where C=3 (DNA, Actin, Tubulin)
@@ -1642,11 +1632,18 @@ class ApproximateMetrics:
         Returns:
             Biological features of shape (N, 6)
         """
+        # Ensure input is (N, C, H, W)
+        if imgs.ndim == 3:
+            imgs = imgs[np.newaxis, ...]
         if len(imgs.shape) != 4:
-            return np.zeros((imgs.shape[0], 6))
+            return np.zeros((1, 6)) if imgs.shape[0] == 0 else np.zeros((imgs.shape[0], 6))
         
-        means = np.mean(imgs, axis=(2, 3))
-        stds = np.std(imgs, axis=(2, 3))
+        # Calculate Mean and Std along spatial dimensions (axis 2 and 3)
+        # Shape: (N, 3) for both means and stds
+        means = np.mean(imgs, axis=(2, 3))  # Shape (N, 3)
+        stds = np.std(imgs, axis=(2, 3))    # Shape (N, 3)
+        
+        # Concatenate into a 6D vector per image
         return np.hstack([means, stds])
 
     @staticmethod
@@ -2023,7 +2020,15 @@ class BBBC021AblationRunner:
         return stats
     
     def _pretrain_ddpm(self) -> ImageDDPM:
-        """Pretrain unconditional DDPM on control images."""
+        """
+        Stage 2: Conditional Marginal Pretraining.
+        Implements Report Section 4: "Train a conditional model to learn P(x) and P(y)."
+        
+        CRITICAL: Must train on FULL dataset with conditioning enabled.
+        The model learns the distribution of both Healthy and Perturbed cells,
+        conditioned on the drug embedding, BEFORE attempting to couple them.
+        """
+        # 1. Initialize Conditional Model (NOT unconditional)
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
@@ -2032,7 +2037,8 @@ class BBBC021AblationRunner:
             time_emb_dim=self.config.time_embed_dim,
             lr=self.config.ddpm_lr,
             device=self.config.device,
-            conditional=False,
+            conditional=True,  # <--- CRITICAL CHANGE: Must be True for marginal pretraining
+            cond_emb_dim=self.config.perturbation_embed_dim,
         )
         
         # Try to load checkpoint
@@ -2043,18 +2049,15 @@ class BBBC021AblationRunner:
             return ddpm
         
         if start_epoch > 0:
-            print(f"  Resuming pretraining from epoch {start_epoch}/{self.config.ddpm_epochs}...")
+            print(f"  Resuming conditional marginal pretraining from epoch {start_epoch}/{self.config.ddpm_epochs}...")
         else:
-            print(f"  Training unconditional DDPM for {self.config.ddpm_epochs} epochs...")
+            print(f"  Training Conditional DDPM (Marginals) on FULL dataset for {self.config.ddpm_epochs} epochs...")
         
-        # Get control images only
-        control_indices = self.train_dataset.get_control_indices()
-        control_dataset = Subset(self.train_dataset, control_indices)
-        # Optimized for 144GB GPU - increase workers to prevent CPU bottleneck
-        # Windows compatibility: use num_workers=0 to avoid frozen process bug
+        # 2. Use Full Dataset (Not just controls)
+        # We need images AND their associated drug fingerprints
         num_workers = 0 if os.name == 'nt' else 32
         dataloader = DataLoader(
-            control_dataset,
+            self.train_dataset,  # Use FULL dataset
             batch_size=self.config.ddpm_batch_size,
             shuffle=True,
             num_workers=num_workers,
@@ -2075,6 +2078,7 @@ class BBBC021AblationRunner:
             epoch_losses = []
             for batch_idx, batch in enumerate(dataloader):
                 images = batch['image'].to(self.config.device)
+                fingerprint = batch['fingerprint'].to(self.config.device)
                 
                 # Diagnostic check: verify image normalization on first batch of first epoch
                 if epoch == start_epoch and batch_idx == 0:
@@ -2083,8 +2087,18 @@ class BBBC021AblationRunner:
                     print(f"    [DIAGNOSTIC] Image stats - Min: {img_min:.3f}, Max: {img_max:.3f}, Mean: {img_mean:.3f}, Std: {img_std:.3f}")
                     if not (-1.01 <= img_min and img_max <= 1.01):
                         print(f"    [WARNING] Images not in [-1, 1] range! This will cause training to stall.")
-                    
-                loss = ddpm.train_step(images)
+                
+                # 3. Conditional Training Step
+                # We condition on the drug to learn "What does Taxol look like?"
+                # For the 'control' input channel, we pass zeros during pretraining
+                # because we aren't doing style transfer yet, just learning densities.
+                dummy_control = torch.zeros_like(images)
+                
+                loss = ddpm.train_step(
+                    x0=images,
+                    control=dummy_control,
+                    fingerprint=fingerprint
+                )
                 epoch_losses.append(loss)
             
             avg_loss = np.mean(epoch_losses)
@@ -2092,8 +2106,8 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            # Evaluate and track metrics
-            metrics = self._evaluate_pretrain(ddpm, control_dataset)
+            # Evaluate and track metrics (use full dataset for evaluation)
+            metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['phase'] = 'pretraining'
@@ -2102,7 +2116,7 @@ class BBBC021AblationRunner:
             pretrain_metrics.append(metrics)
             
             # Plot every epoch
-            self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'DDPM Pretraining')
+            self._plot_checkpoint(pretrain_metrics, pretrain_plot_dir, epoch, 'Pretraining', 'Conditional DDPM Marginal Pretraining')
             
             if (epoch + 1) % 2 == 0:
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
@@ -2118,7 +2132,12 @@ class BBBC021AblationRunner:
         return ddpm
     
     def _create_conditional_ddpm(self, pretrain_ddpm: ImageDDPM) -> ImageDDPM:
-        """Create conditional DDPM and initialize from pretrained."""
+        """
+        Create conditional DDPM for coupling phase and initialize from pretrained.
+        
+        Note: Since pretraining is now conditional (Report Section 4), both models
+        have the same architecture, so weight transfer is straightforward.
+        """
         cond_ddpm = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
@@ -2131,7 +2150,7 @@ class BBBC021AblationRunner:
             cond_emb_dim=self.config.perturbation_embed_dim,
         )
         
-        # Smart weight transfer (handle architecture mismatch)
+        # Weight transfer: Both models are now conditional, so architectures match
         pretrained_state = pretrain_ddpm.model.state_dict()
         current_state = cond_ddpm.model.state_dict()
         
@@ -2139,12 +2158,17 @@ class BBBC021AblationRunner:
             if key in pretrained_state:
                 if pretrained_state[key].shape == current_state[key].shape:
                     current_state[key] = pretrained_state[key].clone()
-                elif 'init_conv' in key:
-                    # Handle input channel mismatch (3 vs 6 for conditional)
-                    current_state[key][:, :3] = pretrained_state[key]
-                    print(f"    Partially loaded {key}")
+                else:
+                    # Shouldn't happen now that both are conditional, but keep for safety
+                    print(f"    Warning: Shape mismatch for {key}, skipping transfer")
         
         cond_ddpm.model.load_state_dict(current_state)
+        
+        # Also transfer perturbation encoder if available
+        if pretrain_ddpm.perturbation_encoder is not None and cond_ddpm.perturbation_encoder is not None:
+            cond_ddpm.perturbation_encoder.load_state_dict(
+                pretrain_ddpm.perturbation_encoder.state_dict()
+            )
         
         return cond_ddpm
     
@@ -2629,8 +2653,11 @@ class BBBC021AblationRunner:
         
         return metrics
     
-    def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset: Subset) -> Dict:
-        """Evaluate pretrained unconditional DDPM."""
+    def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset) -> Dict:
+        """
+        Evaluate pretrained conditional DDPM.
+        Works with both Dataset and Subset objects.
+        """
         ddpm.model.eval()
         
         # Sample some images
@@ -2647,16 +2674,29 @@ class BBBC021AblationRunner:
         )
         
         with torch.no_grad():
-            # Get real images
+            # Get real images and their fingerprints
             for i, batch in enumerate(dataloader):
                 if len(real_images) >= num_samples:
                     break
                 images = batch['image'].to(self.config.device)
+                fingerprints = batch['fingerprint'].to(self.config.device)
                 real_images.append(images.cpu().numpy())
-            
-            # Generate fake images
-            generated = ddpm.sample(num_samples, num_steps=self.config.num_sampling_steps)
-            fake_images.append(generated.cpu().numpy())
+                
+                # Generate fake images with conditioning
+                if ddpm.conditional:
+                    # For conditional model, use dummy control (zeros) and real fingerprints
+                    dummy_control = torch.zeros_like(images)
+                    generated = ddpm.sample(
+                        len(images), 
+                        control=dummy_control,
+                        fingerprint=fingerprints,
+                        num_steps=self.config.num_sampling_steps
+                    )
+                else:
+                    # Unconditional (shouldn't happen with new pretraining, but keep for compatibility)
+                    generated = ddpm.sample(len(images), num_steps=self.config.num_sampling_steps)
+                
+                fake_images.append(generated.cpu().numpy())
         
         real_images = np.concatenate(real_images, axis=0)[:num_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:num_samples]
