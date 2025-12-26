@@ -1712,6 +1712,10 @@ class BBBC021AblationRunner:
     def __init__(self, config: BBBC021Config):
         self.config = config
         
+        # [NEW] Session Cache: Stores the specific CSV path chosen for this run
+        # Prevents creating new files for every epoch; locks to one file per session.
+        self._session_csv_paths = {}
+        
         # Set seeds
         np.random.seed(config.seed)
         torch.manual_seed(config.seed)
@@ -2674,17 +2678,50 @@ class BBBC021AblationRunner:
         return metrics
     
     def _save_metrics_to_csv(self, metrics: List[Dict], checkpoint_dir: str, method: str, config_str: str = ""):
-        """Save metrics to CSV file."""
+        """
+        Save metrics to CSV with smart versioning. 
+        If resuming, it creates a new file (e.g., _1.csv, _2.csv) instead of overwriting the old one.
+        """
         if not metrics:
             return
         
-        csv_path = os.path.join(checkpoint_dir, f"{method}_metrics.csv")
+        # 1. Create a unique key for this specific context (folder + stage/method)
+        session_key = os.path.join(checkpoint_dir, method)
+
+        # 2. Determine the filename (Only do this ONCE per run session)
+        if session_key not in self._session_csv_paths:
+            base_name = f"{method}_metrics.csv"
+            file_path = os.path.join(checkpoint_dir, base_name)
+            
+            # If the default file exists, find the next available counter
+            if os.path.exists(file_path):
+                counter = 1
+                while True:
+                    new_name = f"{method}_metrics_{counter}.csv"
+                    new_path = os.path.join(checkpoint_dir, new_name)
+                    if not os.path.exists(new_path):
+                        file_path = new_path
+                        print(f"  [Log] Previous metrics found. Creating new session file: {os.path.basename(file_path)}")
+                        break
+                    counter += 1
+            
+            # Store this decision so we keep writing to this specific file for the rest of the run
+            self._session_csv_paths[session_key] = file_path
+
+        # 3. Retrieve the assigned path
+        final_path = self._session_csv_paths[session_key]
+        
+        # 4. Write data
+        # We use 'w' mode to overwrite the file *with the growing list* from this session.
         fieldnames = list(metrics[0].keys())
         
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(metrics)
+        try:
+            with open(final_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(metrics)
+        except Exception as e:
+            print(f"Warning: Failed to save metrics to CSV: {e}")
     
     def _plot_checkpoint(self, epoch_metrics: List[Dict], checkpoint_dir: str, epoch: int, method: str, config_str: str):
         """Generate comprehensive checkpoint plot (including warmup epochs with shading)."""
