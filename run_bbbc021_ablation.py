@@ -182,7 +182,7 @@ class BBBC021Config:
     enable_bio_loss: bool = False  # Enable DNA preservation loss in PPO
     
     # Evaluation
-    num_eval_samples: int = 500
+    num_eval_samples: int = 5000
     fid_batch_size: int = 64
     
     # Memory optimization
