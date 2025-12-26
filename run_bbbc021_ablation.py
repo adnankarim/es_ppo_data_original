@@ -1505,9 +1505,11 @@ class ImageMetrics:
     """
     
     @staticmethod
+    @torch.no_grad()
     def compute_fid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda') -> float:
         """
         [FIXED] Computes True FID using InceptionV3 features.
+        Uses @torch.no_grad() to prevent VRAM accumulation during large batch evaluation.
         """
         if not TORCHMETRICS_AVAILABLE:
             print("Skipping FID (torchmetrics not found)")
@@ -2047,13 +2049,23 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 5 epochs to save time - FID is computationally expensive)
+            # 2. Evaluate with Dynamic Frequency
+            # Use fast check (500 samples) often, and slow check (5000 samples) rarely
             if (epoch + 1) % 5 == 0:
-                # Calculate FID on a subset of the training data
-                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
+                # Full Eval every 50 epochs, Quick Eval every 5 epochs
+                if (epoch + 1) % 50 == 0:
+                    # Full evaluation with 5000 samples (scientifically valid)
+                    current_eval_limit = self.config.num_eval_samples
+                    eval_label = "FULL"
+                else:
+                    # Quick evaluation with 500 samples (for progress monitoring)
+                    current_eval_limit = 500
+                    eval_label = "QUICK"
+                
+                metrics = self._evaluate_pretrain(ddpm, self.train_dataset, max_samples=current_eval_limit)
                 fid_score = metrics.get('fid', 0.0)
                 
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID ({eval_label}, {current_eval_limit} samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             else:
                 # Simple log for other epochs
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
@@ -2585,15 +2597,22 @@ class BBBC021AblationRunner:
         
         return metrics
     
-    def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset) -> Dict:
+    def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset, max_samples: int = None) -> Dict:
         """
         Evaluate pretrained conditional DDPM.
         Works with both Dataset and Subset objects.
+        
+        Args:
+            ddpm: The DDPM model to evaluate
+            dataset: Dataset to evaluate on
+            max_samples: Maximum number of samples to evaluate (defaults to config.num_eval_samples)
         """
         ddpm.model.eval()
         
-        # Sample some images
-        num_samples = min(100, len(dataset))
+        # Use config value but allow override for speed during training
+        if max_samples is None:
+            max_samples = self.config.num_eval_samples
+        num_samples = min(max_samples, len(dataset))
         real_images = []
         fake_images = []
         
