@@ -2049,23 +2049,13 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate with Dynamic Frequency
-            # Use fast check (500 samples) often, and slow check (5000 samples) rarely
+            # 2. Evaluate (Every 5 epochs with 5000 samples for scientifically valid metrics)
             if (epoch + 1) % 5 == 0:
-                # Full Eval every 50 epochs, Quick Eval every 5 epochs
-                if (epoch + 1) % 50 == 0:
-                    # Full evaluation with 5000 samples (scientifically valid)
-                    current_eval_limit = self.config.num_eval_samples
-                    eval_label = "FULL"
-                else:
-                    # Quick evaluation with 500 samples (for progress monitoring)
-                    current_eval_limit = 500
-                    eval_label = "QUICK"
-                
-                metrics = self._evaluate_pretrain(ddpm, self.train_dataset, max_samples=current_eval_limit)
+                # Use full 5000 samples for scientifically valid FID scores
+                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
                 
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID ({eval_label}, {current_eval_limit} samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID (5000 samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             else:
                 # Simple log for other epochs
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
@@ -2599,43 +2589,36 @@ class BBBC021AblationRunner:
     
     def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset, max_samples: int = None) -> Dict:
         """
-        Evaluate pretrained conditional DDPM.
-        Works with both Dataset and Subset objects.
-        
-        Args:
-            ddpm: The DDPM model to evaluate
-            dataset: Dataset to evaluate on
-            max_samples: Maximum number of samples to evaluate (defaults to config.num_eval_samples)
+        [FIXED] Evaluate pretrained conditional DDPM.
+        Respects num_eval_samples from config (5000) while allowing overrides.
         """
         ddpm.model.eval()
         
-        # Use config value but allow override for speed during training
+        # 1. Use the config value (5000) if no specific limit is passed
         if max_samples is None:
             max_samples = self.config.num_eval_samples
+            
         num_samples = min(max_samples, len(dataset))
         real_images = []
         fake_images = []
         
         dataloader = DataLoader(
             dataset, 
-            batch_size=32, 
+            batch_size=self.config.fid_batch_size,  # Use config batch size for safety
             shuffle=False,
             num_workers=16 if os.name != 'nt' else 0,
             pin_memory=True,
         )
         
         with torch.no_grad():
-            # Get real images and their fingerprints
-            for i, batch in enumerate(dataloader):
+            for batch in dataloader:
                 if len(real_images) >= num_samples:
                     break
                 images = batch['image'].to(self.config.device)
                 fingerprints = batch['fingerprint'].to(self.config.device)
                 real_images.append(images.cpu().numpy())
                 
-                # Generate fake images with conditioning
                 if ddpm.conditional:
-                    # For conditional model, use dummy control (zeros) and real fingerprints
                     dummy_control = torch.zeros_like(images)
                     generated = ddpm.sample(
                         len(images), 
@@ -2643,27 +2626,22 @@ class BBBC021AblationRunner:
                         fingerprint=fingerprints,
                         num_steps=self.config.num_sampling_steps
                     )
-                else:
-                    # Unconditional (shouldn't happen with new pretraining, but keep for compatibility)
-                    generated = ddpm.sample(len(images), num_steps=self.config.num_sampling_steps)
-                
-                fake_images.append(generated.cpu().numpy())
+                    fake_images.append(generated.cpu().numpy())
         
+        # Flatten lists and truncate to exact num_samples
         real_images = np.concatenate(real_images, axis=0)[:num_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:num_samples]
         
-        # Compute metrics
+        # 2. Calculate FID using the new device-aware method
         fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
+        
+        # Calculate fast metrics
         mse = ImageMetrics.compute_mse(real_images, fake_images)
         mae = ImageMetrics.compute_mae(real_images, fake_images)
         ssim = ImageMetrics.compute_ssim(real_images, fake_images)
-        
-        # Information theoretic metrics
         info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
         
-        metrics = {
-            'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim,
-        }
+        metrics = {'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim}
         metrics.update(info_metrics)
         
         return metrics
