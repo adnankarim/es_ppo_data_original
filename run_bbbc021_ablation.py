@@ -1996,8 +1996,8 @@ class BBBC021AblationRunner:
         return stats
     
     def _pretrain_ddpm(self) -> ImageDDPM:
-        """[FIXED] Conditional Marginal Pretraining on FULL dataset."""
-        # 1. Initialize Conditional Model (Changed from False to True)
+        """[FIXED] Conditional Marginal Pretraining with Smart Resume Logic."""
+        # 1. Initialize Conditional Model
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
@@ -2006,18 +2006,32 @@ class BBBC021AblationRunner:
             time_emb_dim=self.config.time_embed_dim,
             lr=self.config.ddpm_lr,
             device=self.config.device,
-            conditional=True,  # <--- CRITICAL: Must be True
+            conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
         )
         
         # Try to load checkpoint
         start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
-        if start_epoch >= self.config.ddpm_epochs:
+        
+        # --- SMART RESUME LOGIC ---
+        target_epoch = self.config.ddpm_epochs
+        
+        # Case 1: We are already past the target (e.g. At Epoch 100, Config says 10)
+        # Fix: Assume user wants to train for +10 MORE epochs
+        if start_epoch > target_epoch:
+            print(f"  [Smart Resume] Current Epoch ({start_epoch}) > Config Epochs ({target_epoch}).")
+            print(f"  [Smart Resume] Switching to INCREMENTAL mode: Training for +{target_epoch} extra epochs.")
+            target_epoch = start_epoch + target_epoch
+            
+        # Case 2: We are exactly at the target (e.g. At Epoch 500, Config says 500)
+        # Fix: Assume we are done.
+        elif start_epoch == target_epoch:
+            print(f"  [Smart Resume] Model already reached target epoch {target_epoch}. Skipping Pretraining.")
             return ddpm
 
-        print(f"  Training Conditional DDPM on FULL dataset...")
+        print(f"  Training Conditional DDPM from Epoch {start_epoch+1} to {target_epoch}...")
 
-        # 2. Use Full Dataset (Changed from Control Subset)
+        # 2. Use Full Dataset
         dataloader = DataLoader(
             self.train_dataset, 
             batch_size=self.config.ddpm_batch_size,
@@ -2026,7 +2040,7 @@ class BBBC021AblationRunner:
             pin_memory=True
         )
 
-        for epoch in range(start_epoch, self.config.ddpm_epochs):
+        for epoch in range(start_epoch, target_epoch):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -2053,17 +2067,28 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 5 epochs with exactly 5000 samples for scientifically valid metrics)
+            # 2. Evaluate with Dynamic Frequency
             if (epoch + 1) % 5 == 0:
-                # Use exactly 5000 samples for scientifically valid FID scores
-                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
-                fid_score = metrics.get('fid', 0.0)
-                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
+                # Full Eval every 50 epochs, Quick Eval every 5 epochs
+                if (epoch + 1) % 50 == 0:
+                    current_eval_limit = self.config.num_eval_samples
+                    eval_label = "FULL"
+                else:
+                    current_eval_limit = 500
+                    eval_label = "QUICK"
                 
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID ({num_samples_used} samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                metrics = self._evaluate_pretrain(ddpm, self.train_dataset, max_samples=current_eval_limit)
+                fid_score = metrics.get('fid', 0.0)
+                
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({eval_label}, {current_eval_limit}): {fid_score:.2f} | GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                
+                # Save metrics to CSV (New Session Aware)
+                metrics['epoch'] = epoch + 1
+                metrics['loss'] = avg_loss
+                metrics['phase'] = 'pretraining'
+                self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
             else:
-                # Simple log for other epochs
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f}")
 
             # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
@@ -2609,7 +2634,8 @@ class BBBC021AblationRunner:
     def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset, max_samples: int = None) -> Dict:
         """
         [FIXED] Evaluate pretrained conditional DDPM.
-        Uses exactly num_eval_samples (5000) samples - no less.
+        Uses exactly max_samples if provided, otherwise defaults to num_eval_samples (5000).
+        Supports dynamic evaluation (QUICK: 500, FULL: 5000).
         """
         ddpm.model.eval()
         
