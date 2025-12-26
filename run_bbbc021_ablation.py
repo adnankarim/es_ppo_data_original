@@ -2067,20 +2067,14 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate with Dynamic Frequency
+            # 2. Evaluate (Every 5 epochs with exactly 5000 samples for scientifically valid metrics)
             if (epoch + 1) % 5 == 0:
-                # Full Eval every 50 epochs, Quick Eval every 5 epochs
-                if (epoch + 1) % 50 == 0:
-                    current_eval_limit = self.config.num_eval_samples
-                    eval_label = "FULL"
-                else:
-                    current_eval_limit = 500
-                    eval_label = "QUICK"
-                
-                metrics = self._evaluate_pretrain(ddpm, self.train_dataset, max_samples=current_eval_limit)
+                # Use exactly 5000 samples for scientifically valid FID scores
+                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
+                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({eval_label}, {current_eval_limit}): {fid_score:.2f} | GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used} samples): {fid_score:.2f} | GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
                 # Save metrics to CSV (New Session Aware)
                 metrics['epoch'] = epoch + 1
