@@ -2068,7 +2068,7 @@ class BBBC021AblationRunner:
             gpu_stats = self._get_gpu_stats()
 
             # 2. Evaluate (Every 5 epochs with exactly 5000 samples for scientifically valid metrics)
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 10 == 0:
                 # Use exactly 5000 samples for scientifically valid FID scores
                 metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
