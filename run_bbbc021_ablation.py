@@ -2021,22 +2021,44 @@ class BBBC021AblationRunner:
         )
 
         for epoch in range(start_epoch, self.config.ddpm_epochs):
+            # Reset peak memory stats at start of epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            
             epoch_losses = []
+            
+            # 1. Train
             for batch in dataloader:
                 images = batch['image'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
-                # 3. Conditional Training
-                # Pass zero-control to force learning from fingerprint
+                # Conditional Training with zero-control
                 dummy_control = torch.zeros_like(images)
                 
-                loss = ddpm.train_step(x0=images, control=dummy_control, fingerprint=fingerprint)
+                loss = ddpm.train_step(
+                    x0=images, 
+                    control=dummy_control, 
+                    fingerprint=fingerprint
+                )
                 epoch_losses.append(loss)
             
-            # Keep logging/saving logic
             avg_loss = np.mean(epoch_losses)
+            
+            # Get GPU stats
+            gpu_stats = self._get_gpu_stats()
+
+            # 2. Evaluate (Every 5 epochs to save time - FID is computationally expensive)
             if (epoch + 1) % 5 == 0:
+                # Calculate FID on a subset of the training data
+                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
+                fid_score = metrics.get('fid', 0.0)
+                
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID: {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+            else:
+                # Simple log for other epochs
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+
+            # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
             
         return ddpm
