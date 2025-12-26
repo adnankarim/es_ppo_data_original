@@ -2049,13 +2049,14 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 5 epochs with 5000 samples for scientifically valid metrics)
+            # 2. Evaluate (Every 5 epochs with exactly 5000 samples for scientifically valid metrics)
             if (epoch + 1) % 5 == 0:
-                # Use full 5000 samples for scientifically valid FID scores
+                # Use exactly 5000 samples for scientifically valid FID scores
                 metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
+                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID (5000 samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, FID ({num_samples_used} samples): {fid_score:.2f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             else:
                 # Simple log for other epochs
                 print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
@@ -2241,7 +2242,8 @@ class BBBC021AblationRunner:
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', f'σ={sigma}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID ({num_samples_used} samples)={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2361,7 +2363,8 @@ class BBBC021AblationRunner:
             self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', f'KL={kl_weight}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID ({num_samples_used} samples)={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2535,7 +2538,7 @@ class BBBC021AblationRunner:
         return nscb_metrics
     
     def _evaluate(self, cond_ddpm: ImageDDPM) -> Dict:
-        """Evaluate model on validation set."""
+        """Evaluate model on validation set. Uses exactly 5000 samples."""
         cond_ddpm.model.eval()
         
         real_images = []
@@ -2547,8 +2550,15 @@ class BBBC021AblationRunner:
             shuffle=False,
         )
         
+        max_samples = self.config.num_eval_samples  # Exactly 5000
+        
+        # Check if we have enough samples
+        if len(self.val_dataset) < max_samples:
+            raise ValueError(
+                f"Validation dataset has only {len(self.val_dataset)} samples, but evaluation requires {max_samples} samples."
+            )
+        
         num_samples = 0
-        max_samples = self.config.num_eval_samples
         
         with torch.no_grad():
             for batch in val_loader:
@@ -2570,6 +2580,11 @@ class BBBC021AblationRunner:
         real_images = np.concatenate(real_images, axis=0)[:max_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:max_samples]
         
+        # Verify we got exactly the right number
+        actual_samples = len(real_images)
+        if actual_samples != max_samples:
+            print(f"WARNING: Expected {max_samples} samples but got {actual_samples}")
+        
         # 1. Standard Metrics
         fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
         mse = ImageMetrics.compute_mse(real_images, fake_images)
@@ -2581,7 +2596,7 @@ class BBBC021AblationRunner:
         
         # Combine
         metrics = {
-            'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim,
+            'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim, 'num_eval_samples': actual_samples,
         }
         metrics.update(info_metrics) # Merge dictionaries
         
@@ -2590,15 +2605,22 @@ class BBBC021AblationRunner:
     def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset, max_samples: int = None) -> Dict:
         """
         [FIXED] Evaluate pretrained conditional DDPM.
-        Respects num_eval_samples from config (5000) while allowing overrides.
+        Uses exactly num_eval_samples (5000) samples - no less.
         """
         ddpm.model.eval()
         
         # 1. Use the config value (5000) if no specific limit is passed
         if max_samples is None:
             max_samples = self.config.num_eval_samples
-            
-        num_samples = min(max_samples, len(dataset))
+        
+        # 2. Enforce exactly max_samples (fail if dataset is too small)
+        if len(dataset) < max_samples:
+            raise ValueError(
+                f"Dataset has only {len(dataset)} samples, but evaluation requires {max_samples} samples. "
+                f"Please ensure the dataset has at least {max_samples} samples."
+            )
+        
+        num_samples = max_samples  # Use exactly this many, no less
         real_images = []
         fake_images = []
         
@@ -2632,7 +2654,12 @@ class BBBC021AblationRunner:
         real_images = np.concatenate(real_images, axis=0)[:num_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:num_samples]
         
-        # 2. Calculate FID using the new device-aware method
+        # Verify we got exactly the right number
+        actual_samples = len(real_images)
+        if actual_samples != num_samples:
+            print(f"WARNING: Expected {num_samples} samples but got {actual_samples}")
+        
+        # 3. Calculate FID using the new device-aware method
         fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
         
         # Calculate fast metrics
@@ -2641,7 +2668,7 @@ class BBBC021AblationRunner:
         ssim = ImageMetrics.compute_ssim(real_images, fake_images)
         info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
         
-        metrics = {'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim}
+        metrics = {'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim, 'num_eval_samples': actual_samples}
         metrics.update(info_metrics)
         
         return metrics
