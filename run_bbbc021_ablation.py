@@ -147,7 +147,7 @@ class BBBC021Config:
     num_sampling_steps: int = 50
     
     # ES Ablations
-    es_population_size: int = 20
+    es_population_size: int = 50  # Increased default for better gradient estimation
     es_sigma_values: List[float] = field(default_factory=lambda: [0.001, 0.005, 0.01])
     es_lr_values: List[float] = field(default_factory=lambda: [0.0001, 0.0005, 0.001])
     
@@ -1280,21 +1280,26 @@ class ImageDDPM:
 # ============================================================================
 
 class ImageESTrainer:
-    """Evolution Strategies trainer for image DDPM coupling."""
+    """
+    Evolution Strategies trainer for image DDPM coupling.
+    Now includes Biological Consistency Loss (DNA Preservation).
+    """
     
     def __init__(
         self,
         ddpm: ImageDDPM,
-        population_size: int = 20,
+        population_size: int = 50,  # Increased default for better gradient estimation
         sigma: float = 0.005,
         lr: float = 0.0005,
         device: str = "cuda",
+        use_bio_loss: bool = False,  # [NEW] Flag for DNA preservation
     ):
         self.ddpm = ddpm
         self.population_size = population_size
         self.sigma = sigma
         self.lr = lr
         self.device = torch.device(device)
+        self.use_bio_loss = use_bio_loss
     
     def compute_fitness(
         self,
@@ -1333,7 +1338,15 @@ class ImageESTrainer:
             if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
                 return -float('inf')
             
+            # 1. Base MSE Loss (Reconstruction)
             loss = F.mse_loss(noise_pred, noise)
+            
+            # 2. [NEW] Biological Consistency Loss (DNA Preservation)
+            # Channel 0 is DAPI (DNA/Nucleus). We enforce that the nucleus noise 
+            # matches the ground truth more strictly than the cytoskeleton.
+            if self.use_bio_loss:
+                dna_loss = F.mse_loss(noise_pred[:, 0, :, :], noise[:, 0, :, :])
+                loss = loss + 0.1 * dna_loss  # 0.1 weight matches PPO settings
             
             if torch.isnan(loss) or torch.isinf(loss):
                 return -float('inf')
@@ -2346,6 +2359,7 @@ class BBBC021AblationRunner:
             sigma=sigma,
             lr=lr,
             device=self.config.device,
+            use_bio_loss=self.config.enable_bio_loss,  # [ADDED] Pass the flag
         )
         
         print(f"  [Incremental] Starting ES Training: {es_start_epoch} -> {es_target_epoch}")
@@ -2543,21 +2557,12 @@ class BBBC021AblationRunner:
     
     def _nscb_benchmark(self, cond_ddpm: ImageDDPM, test_batch_name: str = None) -> Dict:
         """
-        NSCB (Not-Same-Compound-or-Batch) Evaluation.
-        
-        Final benchmark as per CellFlux paper standards.
+        [FIXED] NSCB Evaluation using Deep Features (Paper Compliant).
         Tests on a 'Hold-out Batch' to measure Batch-Effect correction.
-        This proves the model can generalize to new labs/batches it never saw during training.
-        
-        Args:
-            cond_ddpm: Trained conditional DDPM model
-            test_batch_name: Specific batch to use for testing (e.g., 'Week10')
-                           If None, uses a batch not seen in training
-        
-        Returns:
-            Dictionary with NSCB metrics including MoA accuracy
         """
+        print("\n=== Running NSCB Benchmark (Batch Generalization) ===")
         cond_ddpm.model.eval()
+        metrics_engine = ImageMetrics(device=self.config.device)
         
         # Get all batches from validation set
         all_batches = set(m['batch'] for m in self.val_dataset.metadata)
@@ -2598,10 +2603,9 @@ class BBBC021AblationRunner:
             pin_memory=True,
         )
         
-        real_images = []
-        fake_images = []
-        moa_labels = []
-        compound_labels = []
+        all_real = []
+        all_fake = []
+        all_moas = []
         
         with torch.no_grad():
             for batch in test_loader:
@@ -2609,7 +2613,6 @@ class BBBC021AblationRunner:
                 images = batch['image'].to(self.config.device)
                 fingerprints = batch['fingerprint'].to(self.config.device)
                 moa_idxs = batch['moa_idx'].cpu().numpy()
-                compound_idxs = batch['compound_idx'].cpu().numpy()
                 
                 # Find control images from same batch
                 controls = []
@@ -2635,50 +2638,50 @@ class BBBC021AblationRunner:
                     num_steps=self.config.num_sampling_steps,
                 )
                 
-                real_images.append(images.cpu().numpy())
-                fake_images.append(generated.cpu().numpy())
-                moa_labels.extend(moa_idxs)
-                compound_labels.extend(compound_idxs)
+                all_real.append(images.cpu().numpy())
+                all_fake.append(generated.cpu().numpy())
+                all_moas.extend(moa_idxs)
         
-        real_images = np.concatenate(real_images, axis=0)
-        fake_images = np.concatenate(fake_images, axis=0)
+        real_imgs = np.concatenate(all_real, axis=0)
+        fake_imgs = np.concatenate(all_fake, axis=0)
+        moas = np.array(all_moas)
         
-        # Compute standard metrics
-        fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
-        mse = ImageMetrics.compute_mse(real_images, fake_images)
-        mae = ImageMetrics.compute_mae(real_images, fake_images)
-        ssim = ImageMetrics.compute_ssim(real_images, fake_images)
+        # --- KEY FIX: Use Deep Features for Final Benchmark ---
+        print("  Extracting Deep Features for Final MoA Check...")
+        real_feats = metrics_engine.get_features(real_imgs)
+        fake_feats = metrics_engine.get_features(fake_imgs)
         
-        # Information theoretic metrics
-        info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
+        # Compute standard metrics (still using legacy methods for compatibility)
+        fid = ImageMetrics.compute_fid(real_imgs, fake_imgs, device=self.config.device)
+        mse = ImageMetrics.compute_mse(real_imgs, fake_imgs)
+        mae = ImageMetrics.compute_mae(real_imgs, fake_imgs)
+        ssim = ImageMetrics.compute_ssim(real_imgs, fake_imgs)
         
-        # MoA Classification Accuracy using biological features (CellFlux methodology)
-        # Extract biological features instead of raw pixels
-        real_bio_features = ApproximateMetrics._get_bio_features(real_images)
-        fake_bio_features = ApproximateMetrics._get_bio_features(fake_images)
+        # Compute profile similarity (Pixel-based is fine for this specific metric)
+        info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
         
-        # Use sklearn 1-NN classifier with cosine distance
-        if SKLEARN_AVAILABLE and len(moa_labels) > 0:
-            moa_accuracy = ImageMetrics.compute_moa_accuracy(
-                real_bio_features, fake_bio_features, np.array(moa_labels)
+        # MoA Accuracy using Deep Features (Paper Compliant)
+        moa_acc = 0.0
+        if SKLEARN_AVAILABLE and len(moas) > 0 and real_feats is not None and fake_feats is not None:
+            moa_acc = ImageMetrics.compute_deep_moa_accuracy(
+                real_feats.numpy(), 
+                fake_feats.numpy(), 
+                moas
             )
-        else:
-            moa_accuracy = 0.0
-            if not SKLEARN_AVAILABLE:
-                print("  Warning: sklearn not available, skipping MoA accuracy calculation")
+        
+        print(f"  NSCB Result -> MoA Accuracy (Deep): {moa_acc*100:.2f}%")
+        print(f"  NSCB Result -> Profile Similarity:  {info_metrics.get('profile_similarity', 0):.4f}")
         
         nscb_metrics = {
             'nscb_fid': fid,
             'nscb_mse': mse,
             'nscb_mae': mae,
             'nscb_ssim': ssim,
-            'nscb_moa_accuracy': float(moa_accuracy),
+            'nscb_moa_accuracy': float(moa_acc),
             'nscb_test_batch': test_batch,
             'nscb_num_samples': len(test_indices),
         }
         nscb_metrics.update({f'nscb_{k}': v for k, v in info_metrics.items()})
-        
-        print(f"  NSCB Results: FID={fid:.2f}, MoA Accuracy={moa_accuracy:.4f}, Profile Similarity={info_metrics.get('profile_similarity', 0):.4f}")
         
         return nscb_metrics
     
@@ -3744,6 +3747,8 @@ def main():
     parser.add_argument("--es-lr-values", type=float, nargs='+',
                        default=[0.0001, 0.0005, 0.001],
                        help="ES learning rate values")
+    parser.add_argument("--es-population-size", type=int, default=50,
+                       help="Population size for Evolution Strategies (Higher=More Stable)")
     
     # PPO ablation
     parser.add_argument("--ppo-kl-values", type=float, nargs='+',
@@ -3803,6 +3808,7 @@ def main():
         coupling_batch_size=args.coupling_batch_size,
         es_sigma_values=args.es_sigma_values,
         es_lr_values=args.es_lr_values,
+        es_population_size=args.es_population_size,
         ppo_kl_weight_values=args.ppo_kl_values,
         ppo_clip_values=args.ppo_clip_values,
         ppo_lr_values=args.ppo_lr_values,
