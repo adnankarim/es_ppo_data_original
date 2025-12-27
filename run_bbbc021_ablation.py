@@ -2564,126 +2564,74 @@ class BBBC021AblationRunner:
         cond_ddpm.model.eval()
         metrics_engine = ImageMetrics(device=self.config.device)
         
-        # Get all batches from validation set
-        all_batches = set(m['batch'] for m in self.val_dataset.metadata)
-        train_batches = set(m['batch'] for m in self.train_dataset.metadata)
+        # Load Test Data
+        test_dataset = BBBC021Dataset(
+            self.config.data_dir, 
+            self.config.metadata_file, 
+            self.config.image_size, 
+            split="test"
+        )
         
-        # Select test batch (not seen in training)
-        if test_batch_name and test_batch_name in all_batches:
-            test_batch = test_batch_name
-        else:
-            # Find a batch not in training
-            test_batches = list(all_batches - train_batches)
-            if not test_batches:
-                # Fallback: use first validation batch
-                test_batches = list(all_batches)
-            test_batch = test_batches[0] if test_batches else None
-        
-        if test_batch is None:
-            print("Warning: No suitable test batch found for NSCB evaluation")
-            return {}
-        
-        # Filter validation set to test batch only
-        test_indices = [i for i, m in enumerate(self.val_dataset.metadata) 
-                       if m['batch'] == test_batch]
-        
-        if len(test_indices) == 0:
-            print(f"Warning: No samples found in test batch '{test_batch}'")
-            return {}
-        
-        print(f"Running NSCB Benchmark on batch '{test_batch}' ({len(test_indices)} samples)...")
-        
-        # Create test dataset
-        test_subset = Subset(self.val_dataset, test_indices)
-        test_loader = DataLoader(
-            test_subset, 
+        if len(test_dataset) == 0:
+             print("Warning: No test data found. Skipping NSCB.")
+             return {}
+
+        test_loader = BatchPairedDataLoader(
+            test_dataset, 
             batch_size=self.config.coupling_batch_size, 
-            shuffle=False,
-            num_workers=16 if os.name != 'nt' else 0,
-            pin_memory=True,
+            shuffle=False
         )
         
         all_real = []
         all_fake = []
         all_moas = []
         
+        # 1. Generate images
         with torch.no_grad():
             for batch in test_loader:
-                # Get data
-                images = batch['image'].to(self.config.device)
-                fingerprints = batch['fingerprint'].to(self.config.device)
-                moa_idxs = batch['moa_idx'].cpu().numpy()
-                
-                # Find control images from same batch
-                controls = []
-                for idx in batch['idx'].cpu().numpy():
-                    meta = self.val_dataset.metadata[test_indices[idx]]
-                    batch_name = meta['batch']
-                    # Find control in same batch
-                    batch_controls = [i for i, m in enumerate(self.val_dataset.metadata)
-                                    if m['batch'] == batch_name and m['is_control']]
-                    if batch_controls:
-                        control_idx = batch_controls[0]
-                        control_data = self.val_dataset[control_idx]
-                        controls.append(control_data['image'])
-                    else:
-                        # Fallback: use first control
-                        controls.append(self.val_dataset[self.val_dataset.get_control_indices()[0]]['image'])
-                
-                controls = torch.stack(controls).to(self.config.device)
+                control = batch['control'].to(self.config.device)
+                perturbed = batch['perturbed'].to(self.config.device)
+                fingerprint = batch['fingerprint'].to(self.config.device)
                 
                 # Generate
-                generated = cond_ddpm.sample(
-                    len(images), controls, fingerprints,
-                    num_steps=self.config.num_sampling_steps,
-                )
+                gen = cond_ddpm.sample(len(control), control, fingerprint, num_steps=self.config.num_sampling_steps)
                 
-                all_real.append(images.cpu().numpy())
-                all_fake.append(generated.cpu().numpy())
-                all_moas.extend(moa_idxs)
+                all_real.append(perturbed.cpu().numpy())
+                all_fake.append(gen.cpu().numpy())
+                
+                if 'moa_idx' in batch:
+                    all_moas.extend(batch['moa_idx'].cpu().tolist())
         
         real_imgs = np.concatenate(all_real, axis=0)
         fake_imgs = np.concatenate(all_fake, axis=0)
         moas = np.array(all_moas)
         
-        # --- KEY FIX: Use Deep Features for Final Benchmark ---
+        # 2. Extract Deep Features (InceptionV3)
+        # This matches the SOTA standard. Old pixel-stats are too weak.
         print("  Extracting Deep Features for Final MoA Check...")
         real_feats = metrics_engine.get_features(real_imgs)
         fake_feats = metrics_engine.get_features(fake_imgs)
         
-        # Compute standard metrics (still using legacy methods for compatibility)
-        fid = ImageMetrics.compute_fid(real_imgs, fake_imgs, device=self.config.device)
-        mse = ImageMetrics.compute_mse(real_imgs, fake_imgs)
-        mae = ImageMetrics.compute_mae(real_imgs, fake_imgs)
-        ssim = ImageMetrics.compute_ssim(real_imgs, fake_imgs)
-        
-        # Compute profile similarity (Pixel-based is fine for this specific metric)
-        info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
-        
-        # MoA Accuracy using Deep Features (Paper Compliant)
+        # 3. Compute Deep MoA Accuracy
         moa_acc = 0.0
-        if SKLEARN_AVAILABLE and len(moas) > 0 and real_feats is not None and fake_feats is not None:
-            moa_acc = ImageMetrics.compute_deep_moa_accuracy(
+        if SKLEARN_AVAILABLE and len(moas) > 0 and real_feats is not None:
+            moa_acc = metrics_engine.compute_deep_moa_accuracy(
                 real_feats.numpy(), 
                 fake_feats.numpy(), 
                 moas
             )
+            
+        # 4. Compute Profile Similarity (Pixel-based is fine for this specific metric)
+        info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
         
         print(f"  NSCB Result -> MoA Accuracy (Deep): {moa_acc*100:.2f}%")
         print(f"  NSCB Result -> Profile Similarity:  {info_metrics.get('profile_similarity', 0):.4f}")
         
-        nscb_metrics = {
-            'nscb_fid': fid,
-            'nscb_mse': mse,
-            'nscb_mae': mae,
-            'nscb_ssim': ssim,
-            'nscb_moa_accuracy': float(moa_acc),
-            'nscb_test_batch': test_batch,
-            'nscb_num_samples': len(test_indices),
+        return {
+            'nscb_moa_accuracy': moa_acc,
+            'nscb_profile_similarity': info_metrics.get('profile_similarity', 0),
+            'nscb_num_samples': len(real_imgs)
         }
-        nscb_metrics.update({f'nscb_{k}': v for k, v in info_metrics.items()})
-        
-        return nscb_metrics
     
     def _evaluate(self, cond_ddpm: ImageDDPM) -> Dict:
         """
