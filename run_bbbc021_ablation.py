@@ -1530,7 +1530,8 @@ class ImagePPOTrainer:
 
 class ImageMetrics:
     """
-    [PAPER COMPLIANT] Metrics suite matching CellFlux (ICML 2025) protocols.
+    [FIXED] Metrics suite matching CellFlux (ICML 2025) protocols.
+    - Fixes 'dtype=torch.uint8' crash by casting tensors before Inception.
     - Uses InceptionV3 features for MoA Accuracy (Deep Proxy).
     - Supports Conditional FID (per-compound).
     - Scaled KID calculation.
@@ -1555,24 +1556,31 @@ class ImageMetrics:
         if self.inception is None:
             return None
         
+        # 1. Convert to Float Tensor on Device
         images_t = torch.tensor(images).float().to(self.device)
-        # Normalize to [0, 1]
+        
+        # 2. Normalize to [0, 1] Range
+        # If images are [-1, 1] (standard DDPM output), map to [0, 1]
         if images_t.min() < 0:
             images_t = (images_t + 1.0) / 2.0
         images_t = torch.clamp(images_t, 0.0, 1.0)
         
-        # Resize to 299x299 for Inception (standard input size)
         features = []
         batch_size = 32
+        
         for i in range(0, len(images_t), batch_size):
             batch = images_t[i:i+batch_size]
-            # Upsample to 299x299 (Inception standard)
+            
+            # 3. Resize to 299x299 (Inception Standard)
             if batch.shape[-1] != 299 or batch.shape[-2] != 299:
                 batch = F.interpolate(batch, size=(299, 299), mode='bilinear', align_corners=False)
-            # Inception expects normalized inputs [0, 1] -> [0, 255] then normalize
-            # torchmetrics handles normalization internally, so we pass [0,1] range
-            # The inception model in torchmetrics expects [0,1] normalized inputs
-            feats = self.inception(batch)
+            
+            # 4. [CRITICAL FIX] Convert to uint8 [0, 255]
+            # The internal torch-fidelity module explicitly checks for uint8
+            batch_uint8 = (batch * 255).to(torch.uint8)
+            
+            # 5. Extract Features
+            feats = self.inception(batch_uint8)
             features.append(feats.cpu())
             
         return torch.cat(features)
