@@ -2076,16 +2076,19 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 5 epochs with exactly 5000 samples for scientifically valid metrics)
+            # 2. Evaluate (Every 10 epochs with 5000 samples)
             if (epoch + 1) % 10 == 0:
-                # Use exactly 5000 samples for scientifically valid FID scores
                 metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used} samples): {fid_score:.2f} | GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                # [NEW] Extract Biological Metrics
+                kl_score = metrics.get('kl_div_total', 0.0)
+                mi_score = metrics.get('mutual_information', 0.0)
                 
-                # Save metrics to CSV (New Session Aware)
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used}): {fid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                
+                # Save metrics to CSV
                 metrics['epoch'] = epoch + 1
                 metrics['loss'] = avg_loss
                 metrics['phase'] = 'pretraining'
@@ -2275,7 +2278,13 @@ class BBBC021AblationRunner:
 
             if (epoch + 1) % 5 == 0:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID ({num_samples_used} samples)={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                
+                # [NEW] Extract Biological Metrics
+                kl_score = metrics.get('kl_div_total', 0.0)
+                mi_score = metrics.get('mutual_information', 0.0)
+                profile_sim = metrics.get('profile_similarity', 0.0)
+                
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID={metrics['fid']:.2f} | KL={kl_score:.4f} | MI={mi_score:.4f} | ProfSim={profile_sim:.3f}")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2396,7 +2405,13 @@ class BBBC021AblationRunner:
 
             if (epoch + 1) % 5 == 0:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f}, FID ({num_samples_used} samples)={metrics['fid']:.2f}, MI={metrics['mutual_information']:.4f}, GPU Max: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                
+                # [NEW] Extract Biological Metrics
+                kl_score = metrics.get('kl_div_total', 0.0)
+                mi_score = metrics.get('mutual_information', 0.0)
+                profile_sim = metrics.get('profile_similarity', 0.0)
+
+                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID={metrics['fid']:.2f} | KL={kl_score:.4f} | MI={mi_score:.4f} | ProfSim={profile_sim:.3f}")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
