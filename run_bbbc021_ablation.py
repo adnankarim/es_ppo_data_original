@@ -1871,7 +1871,23 @@ class BBBC021AblationRunner:
         
         # Step 1: Pretrain unconditional DDPM
         print("Step 1: Pretraining unconditional DDPM on control images...")
-        pretrain_ddpm = self._pretrain_ddpm()
+        
+        # [UPDATED] Unpack both model and metrics
+        pretrain_ddpm, best_pretrain_metrics = self._pretrain_ddpm()
+        
+        # [NEW] Print Final Pretraining Baseline
+        print("\n" + "=" * 60)
+        print("FINAL PRETRAINING BASELINE (Stage 1 & 2 Complete)")
+        print("=" * 60)
+        if best_pretrain_metrics['fid'] != float('inf'):
+            print(f"Best Epoch: {best_pretrain_metrics['epoch']}")
+            print(f"Best FID:   {best_pretrain_metrics['fid']:.2f}")
+            print(f"Baseline KL: {best_pretrain_metrics['kl']:.4f}")
+            print(f"Final Loss:  {best_pretrain_metrics['loss']:.4f}")
+        else:
+            print("Metrics not recorded (Pretraining skipped or < 10 epochs run).")
+            print("Assuming converged model loaded from checkpoint.")
+        print("=" * 60 + "\n")
         
         # Step 2: Run experiments based on mode
         if self.config.mode == "ablation":
@@ -2004,8 +2020,8 @@ class BBBC021AblationRunner:
             
         return stats
     
-    def _pretrain_ddpm(self) -> ImageDDPM:
-        """[FIXED] Conditional Marginal Pretraining with Smart Resume Logic."""
+    def _pretrain_ddpm(self) -> Tuple[ImageDDPM, Dict]:
+        """[FIXED] Conditional Marginal Pretraining with Smart Resume Logic & Best Metric Tracking."""
         # 1. Initialize Conditional Model
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
@@ -2022,21 +2038,21 @@ class BBBC021AblationRunner:
         # Try to load checkpoint
         start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
         
+        # --- TRACKING BEST METRICS ---
+        best_metrics = {'fid': float('inf'), 'kl': 0.0, 'loss': 0.0, 'epoch': 0}
+
         # --- SMART RESUME LOGIC ---
         target_epoch = self.config.ddpm_epochs
         
-        # Case 1: We are already past the target (e.g. At Epoch 100, Config says 10)
-        # Fix: Assume user wants to train for +10 MORE epochs
         if start_epoch > target_epoch:
             print(f"  [Smart Resume] Current Epoch ({start_epoch}) > Config Epochs ({target_epoch}).")
             print(f"  [Smart Resume] Switching to INCREMENTAL mode: Training for +{target_epoch} extra epochs.")
             target_epoch = start_epoch + target_epoch
             
-        # Case 2: We are exactly at the target (e.g. At Epoch 500, Config says 500)
-        # Fix: Assume we are done.
         elif start_epoch == target_epoch:
             print(f"  [Smart Resume] Model already reached target epoch {target_epoch}. Skipping Pretraining.")
-            return ddpm
+            # If skipping, try to load metrics from the last log or return placeholder
+            return ddpm, best_metrics
 
         print(f"  Training Conditional DDPM from Epoch {start_epoch+1} to {target_epoch}...")
 
@@ -2076,18 +2092,20 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 10 epochs with 5000 samples)
+            # 2. Evaluate (Every 10 epochs)
             if (epoch + 1) % 10 == 0:
                 metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
-                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
-                
-                # [NEW] Extract Biological Metrics
                 kl_score = metrics.get('kl_div_total', 0.0)
                 mi_score = metrics.get('mutual_information', 0.0)
+                num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
                 print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used}): {fid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
+                # Update Best Metrics
+                if fid_score < best_metrics['fid']:
+                    best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
+
                 # Save metrics to CSV
                 metrics['epoch'] = epoch + 1
                 metrics['loss'] = avg_loss
@@ -2099,7 +2117,7 @@ class BBBC021AblationRunner:
             # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
             
-        return ddpm
+        return ddpm, best_metrics
     
     def _create_conditional_ddpm(self, pretrain_ddpm: ImageDDPM) -> ImageDDPM:
         """
