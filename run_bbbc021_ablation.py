@@ -1545,8 +1545,9 @@ class ImageMetrics:
         if TORCHMETRICS_AVAILABLE:
             # Initialize InceptionV3 once to save memory
             from torchmetrics.image.fid import FrechetInceptionDistance
+            # normalize=True handles float inputs for the main .update() calls,
+            # but the internal .inception network often expects uint8.
             self.fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-            # Access the internal inception model for feature extraction
             self.inception = self.fid_metric.inception
             self.inception.eval()
 
@@ -1624,11 +1625,12 @@ class ImageMetrics:
         real_t = torch.tensor(real_images).float().to(device)
         fake_t = torch.tensor(fake_images).float().to(device)
         
-        # Normalize
+        # Normalize to [0, 1] for torchmetrics standard update
         if real_t.min() < 0:
             real_t = (real_t + 1.0) / 2.0
             fake_t = (fake_t + 1.0) / 2.0
             
+        # KID handles the uint8 conversion internally if normalize=True
         kid.update(torch.clamp(real_t, 0, 1), real=True)
         kid.update(torch.clamp(fake_t, 0, 1), real=False)
         
@@ -1639,7 +1641,6 @@ class ImageMetrics:
     def compute_deep_moa_accuracy(real_features: np.ndarray, fake_features: np.ndarray, labels: np.ndarray) -> float:
         """
         1-NN Accuracy using Deep Inception Features.
-        This is a 'Strong Proxy' for the CellFlux ResNet evaluation.
         """
         if not SKLEARN_AVAILABLE or len(labels) == 0:
             return 0.0
@@ -1703,6 +1704,7 @@ class ImageMetrics:
         real_t = torch.clamp(real_t, 0.0, 1.0)
         fake_t = torch.clamp(fake_t, 0.0, 1.0)
         
+        # Standard update handles float->uint8 conversion internally
         fid.update(real_t, real=True)
         fid.update(fake_t, real=False)
         
