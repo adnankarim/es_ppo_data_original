@@ -1467,7 +1467,16 @@ class ImagePPOTrainer:
         
         # KL penalty (divergence from pretrained)
         with torch.no_grad():
-            noise_pred_pretrain = self.pretrain_model.model(x_t, t)
+            if self.pretrain_model.conditional:
+                # Encode fingerprint using the PRETRAINED encoder (frozen)
+                # We must use the pretrained model's encoder, not the active one
+                pt_emb = self.pretrain_model.perturbation_encoder(fingerprint_batch)
+                
+                # Pass control and embedding to the reference model
+                noise_pred_pretrain = self.pretrain_model.model(x_t, t, control_batch, pt_emb)
+            else:
+                # Fallback for old unconditional models
+                noise_pred_pretrain = self.pretrain_model.model(x_t, t)
         
         kl_loss = F.mse_loss(noise_pred_cond, noise_pred_pretrain)
         
