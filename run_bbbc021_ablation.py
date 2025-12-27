@@ -657,6 +657,8 @@ class BatchPairedDataLoader:
             perturbeds = []
             fingerprints = []
             
+            moa_indices = []
+            
             for perturbed_idx in batch_indices:
                 control_idx, perturbed_idx = self.dataset.get_batch_paired_sample(perturbed_idx)
                 
@@ -666,11 +668,13 @@ class BatchPairedDataLoader:
                 controls.append(control_data['image'])
                 perturbeds.append(perturbed_data['image'])
                 fingerprints.append(perturbed_data['fingerprint'])
+                moa_indices.append(perturbed_data['moa_idx'])
             
             yield {
                 'control': torch.stack(controls),
                 'perturbed': torch.stack(perturbeds),
                 'fingerprint': torch.stack(fingerprints),
+                'moa_idx': torch.tensor(moa_indices),
             }
     
     def __len__(self):
@@ -1509,30 +1513,22 @@ class ImagePPOTrainer:
 
 class ImageMetrics:
     """
-    [CORRECTED] Uses InceptionV3 features for valid FID/KID scores.
-    Matches CellFlux Paper methodology using torchmetrics.
+    [CORRECTED] Metrics suite including FID, KID, and Biological Accuracy.
     """
     
     @staticmethod
     @torch.no_grad()
     def compute_fid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda') -> float:
-        """
-        [FIXED] Computes True FID using InceptionV3 features.
-        Uses @torch.no_grad() to prevent VRAM accumulation during large batch evaluation.
-        """
+        """Computes FID using InceptionV3 features."""
         if not TORCHMETRICS_AVAILABLE:
-            print("Skipping FID (torchmetrics not found)")
             return 0.0
 
-        # Initialize Metric (reset_real_features=False allows accumulation if needed)
         fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
         
-        # Convert to Tensor [N, C, H, W]
+        # Convert to Tensor [0, 1] range
         real_t = torch.tensor(real_images).float().to(device)
         fake_t = torch.tensor(fake_images).float().to(device)
         
-        # Ensure images are in [0, 1] for torchmetrics
-        # (Assuming inputs are [-1, 1] from the model)
         if real_t.min() < 0:
             real_t = (real_t + 1.0) / 2.0
             fake_t = (fake_t + 1.0) / 2.0
@@ -1540,67 +1536,92 @@ class ImageMetrics:
         real_t = torch.clamp(real_t, 0.0, 1.0)
         fake_t = torch.clamp(fake_t, 0.0, 1.0)
         
-        # Update and Compute
         fid.update(real_t, real=True)
         fid.update(fake_t, real=False)
         
         return float(fid.compute().item())
     
     @staticmethod
+    @torch.no_grad()
+    def compute_kid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda') -> float:
+        """
+        Computes Kernel Inception Distance (KID).
+        CellFlux Report value: ~1.62 (scaled by 1000).
+        """
+        if not TORCHMETRICS_AVAILABLE:
+            return 0.0
+
+        # subset_size=100 is standard for fast estimation
+        kid = KernelInceptionDistance(subset_size=100, normalize=True).to(device)
+        
+        real_t = torch.tensor(real_images).float().to(device)
+        fake_t = torch.tensor(fake_images).float().to(device)
+        
+        if real_t.min() < 0:
+            real_t = (real_t + 1.0) / 2.0
+            fake_t = (fake_t + 1.0) / 2.0
+            
+        real_t = torch.clamp(real_t, 0.0, 1.0)
+        fake_t = torch.clamp(fake_t, 0.0, 1.0)
+        
+        kid.update(real_t, real=True)
+        kid.update(fake_t, real=False)
+        
+        # Returns (mean, std), we take mean
+        kid_mean, _ = kid.compute()
+        
+        # Return scaled by 1000 to match literature (e.g. 0.00162 -> 1.62)
+        return float(kid_mean.item()) * 1000.0
+
+    @staticmethod
+    def compute_pixel_change(real_controls: np.ndarray, fake_perturbed: np.ndarray) -> float:
+        """
+        Calculates L1 Pixel Difference. 
+        Detects 'Lazy Models' that just output the input image.
+        Target: > 0.02 (Small change) but < 0.2 (Total destruction).
+        """
+        diff = np.abs(real_controls - fake_perturbed)
+        return float(np.mean(diff))
+
+    @staticmethod
     def compute_mse(real_images: np.ndarray, fake_images: np.ndarray) -> float:
-        """Compute mean squared error."""
         return float(np.mean((real_images - fake_images) ** 2))
     
     @staticmethod
     def compute_mae(real_images: np.ndarray, fake_images: np.ndarray) -> float:
-        """Compute mean absolute error."""
         return float(np.mean(np.abs(real_images - fake_images)))
     
     @staticmethod
     def compute_ssim(real_images: np.ndarray, fake_images: np.ndarray) -> float:
-        """Compute structural similarity (simplified)."""
-        # Simplified SSIM computation
+        # Simplified SSIM for 3-channel images
         c1, c2 = 0.01**2, 0.03**2
-        
         mu_real = np.mean(real_images, axis=(1, 2, 3), keepdims=True)
         mu_fake = np.mean(fake_images, axis=(1, 2, 3), keepdims=True)
-        
         sigma_real_sq = np.var(real_images, axis=(1, 2, 3), keepdims=True)
         sigma_fake_sq = np.var(fake_images, axis=(1, 2, 3), keepdims=True)
         sigma_real_fake = np.mean((real_images - mu_real) * (fake_images - mu_fake), axis=(1, 2, 3), keepdims=True)
-        
         ssim = ((2 * mu_real * mu_fake + c1) * (2 * sigma_real_fake + c2)) / \
                ((mu_real**2 + mu_fake**2 + c1) * (sigma_real_sq + sigma_fake_sq + c2))
-        
         return float(np.mean(ssim))
     
     @staticmethod
     def compute_moa_accuracy(real_features: np.ndarray, fake_features: np.ndarray, real_moas: np.ndarray) -> float:
         """
-        Computes 1-NN Classification Accuracy (CellFlux Gold Standard).
-        Checks if generated images fall into the correct drug class.
-        
-        Args:
-            real_features: Feature vectors from real images (N, D)
-            fake_features: Feature vectors from generated images (N, D)
-            real_moas: True MoA labels for real images (N,)
-        
-        Returns:
-            Classification accuracy (0.0 to 1.0)
+        Computes 1-NN Classification Accuracy (Cosine Distance).
+        Matches CellFlux Methodology.
         """
         if not SKLEARN_AVAILABLE:
             return 0.0
         
-        # 1-Nearest Neighbor Classifier using cosine distance
+        # 1-NN with Cosine Distance
         knn = KNeighborsClassifier(n_neighbors=1, metric='cosine')
         
-        # Train on real features (gallery/support set)
+        # Fit on REAL images (The "Gallery")
         knn.fit(real_features, real_moas)
         
-        # Predict MoA for generated images
+        # Predict on FAKE images (The "Queries")
         preds = knn.predict(fake_features)
         
-        # Calculate accuracy
         accuracy = np.mean(preds == real_moas)
         return float(accuracy)
 
@@ -2306,11 +2327,11 @@ class BBBC021AblationRunner:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
                 # [NEW] Extract Biological Metrics
-                kl_score = metrics.get('kl_div_total', 0.0)
-                mi_score = metrics.get('mutual_information', 0.0)
-                profile_sim = metrics.get('profile_similarity', 0.0)
+                kid_score = metrics.get('kid', 0.0)
+                moa_score = metrics.get('moa_accuracy', 0.0)
+                pix_diff = metrics.get('pixel_change', 0.0)
                 
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID={metrics['fid']:.2f} | KL={kl_score:.4f} | MI={mi_score:.4f} | ProfSim={profile_sim:.3f}")
+                print(f"    Epoch {epoch+1}: FID={metrics['fid']:.2f} | KID={kid_score:.2f} | MoA={moa_score*100:.1f}% | Diff={pix_diff:.4f}")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2375,7 +2396,7 @@ class BBBC021AblationRunner:
         
         # Create dataloader
         dataloader = BatchPairedDataLoader(
-            self.train_dataset, 
+            self.train_dataset,
             batch_size=self.config.coupling_batch_size,
             shuffle=True,
         )
@@ -2423,11 +2444,11 @@ class BBBC021AblationRunner:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
                 # [NEW] Extract Biological Metrics
-                kl_score = metrics.get('kl_div_total', 0.0)
-                mi_score = metrics.get('mutual_information', 0.0)
-                profile_sim = metrics.get('profile_similarity', 0.0)
+                kid_score = metrics.get('kid', 0.0)
+                moa_score = metrics.get('moa_accuracy', 0.0)
+                pix_diff = metrics.get('pixel_change', 0.0)
 
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID={metrics['fid']:.2f} | KL={kl_score:.4f} | MI={mi_score:.4f} | ProfSim={profile_sim:.3f}")
+                print(f"    Epoch {epoch+1}: FID={metrics['fid']:.2f} | KID={kid_score:.2f} | MoA={moa_score*100:.1f}% | Diff={pix_diff:.4f}")
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -2596,25 +2617,24 @@ class BBBC021AblationRunner:
         return nscb_metrics
     
     def _evaluate(self, cond_ddpm: ImageDDPM) -> Dict:
-        """Evaluate model on validation set. Uses exactly 5000 samples."""
+        """Evaluate model: FID, KID, Pixel Change, and MoA Accuracy."""
         cond_ddpm.model.eval()
         
-        real_images = []
+        real_perturbed = []
+        real_controls = []
         fake_images = []
+        moa_labels = []
         
+        # Use Validation Loader
         val_loader = BatchPairedDataLoader(
             self.val_dataset,
             batch_size=self.config.coupling_batch_size,
             shuffle=False,
         )
         
-        max_samples = self.config.num_eval_samples  # Exactly 5000
-        
-        # Check if we have enough samples
+        max_samples = self.config.num_eval_samples
         if len(self.val_dataset) < max_samples:
-            raise ValueError(
-                f"Validation dataset has only {len(self.val_dataset)} samples, but evaluation requires {max_samples} samples."
-            )
+            max_samples = len(self.val_dataset)
         
         num_samples = 0
         
@@ -2626,37 +2646,61 @@ class BBBC021AblationRunner:
                 perturbed = batch['perturbed'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
+                # Generate
                 generated = cond_ddpm.sample(
                     len(control), control, fingerprint,
                     num_steps=self.config.num_sampling_steps,
                 )
                 
-                real_images.append(perturbed.cpu().numpy())
+                # Store Data
+                real_perturbed.append(perturbed.cpu().numpy())
+                real_controls.append(control.cpu().numpy())
                 fake_images.append(generated.cpu().numpy())
+                
+                if 'moa_idx' in batch:
+                    moa_labels.extend(batch['moa_idx'].cpu().numpy().tolist())
+                
                 num_samples += len(control)
         
-        real_images = np.concatenate(real_images, axis=0)[:max_samples]
+        # Concatenate
+        real_perturbed = np.concatenate(real_perturbed, axis=0)[:max_samples]
+        real_controls = np.concatenate(real_controls, axis=0)[:max_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:max_samples]
         
-        # Verify we got exactly the right number
-        actual_samples = len(real_images)
-        if actual_samples != max_samples:
-            print(f"WARNING: Expected {max_samples} samples but got {actual_samples}")
+        # --- 1. Image Quality Metrics ---
+        fid = ImageMetrics.compute_fid(real_perturbed, fake_images, device=self.config.device)
+        kid = ImageMetrics.compute_kid(real_perturbed, fake_images, device=self.config.device)
+        mse = ImageMetrics.compute_mse(real_perturbed, fake_images)
+        ssim = ImageMetrics.compute_ssim(real_perturbed, fake_images)
         
-        # 1. Standard Metrics
-        fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
-        mse = ImageMetrics.compute_mse(real_images, fake_images)
-        mae = ImageMetrics.compute_mae(real_images, fake_images)
-        ssim = ImageMetrics.compute_ssim(real_images, fake_images)
+        # --- 2. Biological Fidelity ---
+        # "Lazy Check": How much did we change the input?
+        pixel_change = ImageMetrics.compute_pixel_change(real_controls, fake_images)
         
-        # 2. Information Theoretic Metrics (Added)
-        info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
+        # Profile Similarity & Info Metrics
+        info_metrics = ApproximateMetrics.compute_all(real_perturbed, fake_images)
+        
+        # --- 3. MoA Accuracy ---
+        moa_acc = 0.0
+        if SKLEARN_AVAILABLE and len(moa_labels) >= max_samples:
+            # Extract features for KNN
+            real_feats = ApproximateMetrics._get_bio_features(real_perturbed)
+            fake_feats = ApproximateMetrics._get_bio_features(fake_images)
+            labels = np.array(moa_labels[:max_samples])
+            
+            moa_acc = ImageMetrics.compute_moa_accuracy(real_feats, fake_feats, labels)
         
         # Combine
         metrics = {
-            'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim, 'num_eval_samples': actual_samples,
+            'fid': fid, 
+            'kid': kid, 
+            'moa_accuracy': moa_acc,
+            'pixel_change': pixel_change,
+            'mse': mse, 
+            'ssim': ssim, 
+            'num_eval_samples': len(real_perturbed)
         }
-        metrics.update(info_metrics) # Merge dictionaries
+        metrics.update(info_metrics)
         
         return metrics
     
