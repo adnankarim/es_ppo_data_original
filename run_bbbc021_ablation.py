@@ -96,6 +96,125 @@ except ImportError:
     SKLEARN_AVAILABLE = False
     print("WARNING: sklearn not available. MoA metrics will be disabled.")
 
+try:
+    from transformers import AutoImageProcessor, AutoModel, AutoTokenizer
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("WARNING: transformers not installed. Bio-Perceptual Loss & MoLFormer disabled.")
+
+
+# ============================================================================
+# NEW COMPONENTS: BIO-PERCEPTUAL LOSS & MOLFORMER
+# ============================================================================
+
+class BioPerceptualLoss(nn.Module):
+    """
+    Computes semantic distance using DINOv2 (Self-Supervised ViT).
+    Unlike MSE (which looks at pixels), this looks at biological features 
+    (membranes, nuclei texture, organelle density).
+    """
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        if TRANSFORMERS_AVAILABLE:
+            print("Loading DINOv2-Small for Bio-Perceptual Loss...")
+            # dinov2-small is fast and sufficient for biological texture
+            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(device)
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad = False
+            
+            # DINOv2 ImageNet Normalization
+            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
+            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+        else:
+            self.model = None
+
+    def forward(self, pred_x0, target_x0):
+        """
+        Args:
+            pred_x0: Generated images (B, 3, H, W) in range [-1, 1]
+            target_x0: Real images (B, 3, H, W) in range [-1, 1]
+        """
+        if self.model is None: 
+            return torch.tensor(0.0).to(self.device)
+
+        # 1. Denormalize [-1, 1] -> [0, 1]
+        pred = (pred_x0 + 1.0) * 0.5
+        target = (target_x0 + 1.0) * 0.5
+
+        # 2. Resize to 224x224 (Native DINO resolution)
+        # Bilinear interpolation is differentiable
+        pred = F.interpolate(pred, size=(224, 224), mode='bilinear', align_corners=False)
+        target = F.interpolate(target, size=(224, 224), mode='bilinear', align_corners=False)
+
+        # 3. Normalize for DINO
+        pred = (pred - self.mean) / self.std
+        target = (target - self.mean) / self.std
+
+        # 4. Extract Features
+        # We allow gradients to flow back from pred features to the generator
+        pred_out = self.model(pred, output_hidden_states=True)
+        with torch.no_grad():
+            target_out = self.model(target, output_hidden_states=True)
+
+        # Use the CLS token (global structure) + Average of Patch tokens (texture)
+        pred_feat = pred_out.last_hidden_state.mean(dim=1) # (B, 384)
+        target_feat = target_out.last_hidden_state.mean(dim=1)
+
+        # 5. Semantic MSE
+        return F.mse_loss(pred_feat, target_feat)
+
+class MoLFormerEncoder:
+    """
+    Replaces Morgan Fingerprints with Chemical Language Model Embeddings.
+    Uses ChemBERTa (lighter) or MoLFormer to understand chemical structure.
+    """
+    def __init__(self, device='cpu'):
+        self.device = device
+        self.cache = {}
+        if TRANSFORMERS_AVAILABLE:
+            print("Loading ChemBERTa for Chemical Embeddings...")
+            # Using ChemBERTa for speed. For full power, use 'ibm/MoLFormer-XL-75b'
+            model_name = "seyonec/ChemBERTa-zinc-base-v1" 
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name).to(device)
+            self.model.eval()
+            self.embed_dim = 768 # Standard for Base Transformers
+        else:
+            self.embed_dim = 1024 # Fallback to Morgan size
+
+    def encode(self, smiles_list):
+        """
+        Batch encode SMILES strings.
+        Returns: Tensor (B, 768)
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            # Fallback to random noise if transformers missing
+            return torch.randn(len(smiles_list), self.embed_dim).to(self.device)
+
+        if isinstance(smiles_list, str): 
+            smiles_list = [smiles_list]
+        
+        # Check cache to speed up training
+        uncached = [s for s in smiles_list if s not in self.cache]
+        
+        if uncached:
+            with torch.no_grad():
+                # Tokenize
+                inputs = self.tokenizer(uncached, return_tensors="pt", padding=True, truncation=True).to(self.device)
+                outputs = self.model(**inputs)
+                # Use CLS token (index 0) as the chemical summary
+                embeddings = outputs.last_hidden_state[:, 0, :]
+                
+                for s, emb in zip(uncached, embeddings):
+                    self.cache[s] = emb.cpu() # Store on CPU to save GPU RAM
+        
+        # Assemble batch
+        batch_emb = torch.stack([self.cache[s] for s in smiles_list]).to(self.device)
+        return batch_emb
+
 
 # ============================================================================
 # CONFIGURATION
@@ -129,7 +248,7 @@ class BBBC021Config:
     
     # Perturbation encoding
     morgan_bits: int = 1024  # Morgan fingerprint dimensions
-    perturbation_embed_dim: int = 256
+    perturbation_embed_dim: int = 768  # Updated for MoLFormer (ChemBERTa uses 768)
     
     # DDPM pretraining
     ddpm_epochs: int = 500  # Increased from 100 - DDPMs need more epochs to converge (FID < 200)
@@ -198,6 +317,117 @@ class BBBC021Config:
 # MORGAN FINGERPRINT ENCODER
 # ============================================================================
 
+# ============================================================================
+# NEW COMPONENTS: BIO-PERCEPTUAL LOSS & MOLFORMER
+# ============================================================================
+
+class BioPerceptualLoss(nn.Module):
+    """
+    Computes semantic distance using DINOv2 (Self-Supervised ViT).
+    Unlike MSE (which looks at pixels), this looks at biological features 
+    (membranes, nuclei texture, organelle density).
+    """
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        if TRANSFORMERS_AVAILABLE:
+            print("Loading DINOv2-Small for Bio-Perceptual Loss...")
+            # dinov2-small is fast and sufficient for biological texture
+            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(device)
+            self.model.eval()
+            for p in self.model.parameters():
+                p.requires_grad = False
+            
+            # DINOv2 ImageNet Normalization
+            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
+            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+        else:
+            self.model = None
+
+    def forward(self, pred_x0, target_x0):
+        """
+        Args:
+            pred_x0: Generated images (B, 3, H, W) in range [-1, 1]
+            target_x0: Real images (B, 3, H, W) in range [-1, 1]
+        """
+        if self.model is None: 
+            return torch.tensor(0.0).to(self.device)
+
+        # 1. Denormalize [-1, 1] -> [0, 1]
+        pred = (pred_x0 + 1.0) * 0.5
+        target = (target_x0 + 1.0) * 0.5
+
+        # 2. Resize to 224x224 (Native DINO resolution)
+        # Bilinear interpolation is differentiable
+        pred = F.interpolate(pred, size=(224, 224), mode='bilinear', align_corners=False)
+        target = F.interpolate(target, size=(224, 224), mode='bilinear', align_corners=False)
+
+        # 3. Normalize for DINO
+        pred = (pred - self.mean) / self.std
+        target = (target - self.mean) / self.std
+
+        # 4. Extract Features
+        # We allow gradients to flow back from pred features to the generator
+        pred_out = self.model(pred, output_hidden_states=True)
+        with torch.no_grad():
+            target_out = self.model(target, output_hidden_states=True)
+
+        # Use the CLS token (global structure) + Average of Patch tokens (texture)
+        pred_feat = pred_out.last_hidden_state.mean(dim=1) # (B, 384)
+        target_feat = target_out.last_hidden_state.mean(dim=1)
+
+        # 5. Semantic MSE
+        return F.mse_loss(pred_feat, target_feat)
+
+class MoLFormerEncoder:
+    """
+    Replaces Morgan Fingerprints with Chemical Language Model Embeddings.
+    Uses ChemBERTa (lighter) or MoLFormer to understand chemical structure.
+    """
+    def __init__(self, device='cpu'):
+        self.device = device
+        self.cache = {}
+        if TRANSFORMERS_AVAILABLE:
+            print("Loading ChemBERTa for Chemical Embeddings...")
+            # Using ChemBERTa for speed. For full power, use 'ibm/MoLFormer-XL-75b'
+            model_name = "seyonec/ChemBERTa-zinc-base-v1" 
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name).to(device)
+            self.model.eval()
+            self.embed_dim = 768 # Standard for Base Transformers
+        else:
+            self.embed_dim = 1024 # Fallback to Morgan size
+
+    def encode(self, smiles_list):
+        """
+        Batch encode SMILES strings.
+        Returns: Tensor (B, 768)
+        """
+        if not TRANSFORMERS_AVAILABLE:
+            # Fallback to random noise if transformers missing
+            return torch.randn(len(smiles_list), self.embed_dim).to(self.device)
+
+        if isinstance(smiles_list, str): 
+            smiles_list = [smiles_list]
+        
+        # Check cache to speed up training
+        uncached = [s for s in smiles_list if s not in self.cache]
+        
+        if uncached:
+            with torch.no_grad():
+                # Tokenize
+                inputs = self.tokenizer(uncached, return_tensors="pt", padding=True, truncation=True).to(self.device)
+                outputs = self.model(**inputs)
+                # Use CLS token (index 0) as the chemical summary
+                embeddings = outputs.last_hidden_state[:, 0, :]
+                
+                for s, emb in zip(uncached, embeddings):
+                    self.cache[s] = emb.cpu() # Store on CPU to save GPU RAM
+        
+        # Assemble batch
+        batch_emb = torch.stack([self.cache[s] for s in smiles_list]).to(self.device)
+        return batch_emb
+
 class MorganFingerprintEncoder:
     """
     Encode chemical compounds using Morgan fingerprints.
@@ -258,12 +488,13 @@ class BBBC021Dataset(Dataset):
         image_size: int = 96,
         split: str = "train",  # "train", "val", "test"
         transform: Optional[transforms.Compose] = None,
-        morgan_encoder: Optional[MorganFingerprintEncoder] = None,
+        morgan_encoder: Optional[MorganFingerprintEncoder] = None,  # For backward compatibility, but will use MoLFormer
     ):
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.split = split
-        self.morgan_encoder = morgan_encoder or MorganFingerprintEncoder()
+        # CHANGED: Use MoLFormer if available, passed as 'morgan_encoder' argument for compatibility
+        self.chem_encoder = morgan_encoder or MoLFormerEncoder(device='cpu')
         
         # Default transforms
         if transform is None:
@@ -289,8 +520,8 @@ class BBBC021Dataset(Dataset):
         self.compound_to_idx = {c: i for i, c in enumerate(self.compounds)}
         self.moa_to_idx = {m: i for i, m in enumerate(self.moa_classes)}
         
-        # Precompute fingerprints for all compounds
-        self._precompute_fingerprints()
+        # Precompute embeddings for all compounds
+        self._precompute_embeddings()
         
         print(f"BBBC021 Dataset loaded: {len(self.metadata)} images, "
               f"{len(self.compounds)} compounds, {len(self.moa_classes)} MoA classes")
@@ -495,14 +726,32 @@ class BBBC021Dataset(Dataset):
             batch_to_indices[meta['batch']].append(idx)
         return dict(batch_to_indices)
     
-    def _precompute_fingerprints(self):
-        """Precompute Morgan fingerprints for all compounds."""
+    def _precompute_embeddings(self):
+        """Precompute Embeddings for all compounds."""
+        # Get all unique smiles
+        unique_smiles = {m.get('smiles', '') for m in self.metadata if m.get('smiles')}
+        unique_smiles.discard('')
+        unique_smiles_list = list(unique_smiles)
+        
+        print(f"Pre-encoding {len(unique_smiles_list)} unique compounds with MoLFormer...")
+        # Batch encode to save time
+        if unique_smiles_list:
+            batch_size = 32
+            for i in range(0, len(unique_smiles_list), batch_size):
+                batch = unique_smiles_list[i:i+batch_size]
+                self.chem_encoder.encode(batch)  # Populates cache
+        
+        # Store fingerprints dict for backward compatibility
         self.fingerprints = {}
         for meta in self.metadata:
             compound = meta['compound']
             if compound not in self.fingerprints:
                 smiles = meta.get('smiles', '')
-                self.fingerprints[compound] = self.morgan_encoder.encode(smiles)
+                if not smiles: 
+                    smiles = 'DMSO'  # Fallback
+                # Returns (768,) tensor, convert to numpy for compatibility
+                embedding = self.chem_encoder.encode([smiles]).squeeze(0).cpu().numpy()
+                self.fingerprints[compound] = embedding
     
     def __len__(self) -> int:
         return len(self.metadata)
@@ -514,7 +763,11 @@ class BBBC021Dataset(Dataset):
         image = self._load_image(meta['image_path'])
         
         # Get perturbation embedding
-        fingerprint = torch.tensor(self.fingerprints[meta['compound']], dtype=torch.float32)
+        smiles = meta.get('smiles', '')
+        if not smiles: 
+            smiles = 'DMSO'  # Fallback
+        # Returns (768,) tensor
+        fingerprint = self.chem_encoder.encode([smiles]).squeeze(0)
         
         # Get labels
         moa_idx = self.moa_to_idx.get(meta['moa'], 0)
@@ -1079,6 +1332,7 @@ class ImageDDPM:
         device: str = "cuda",
         conditional: bool = False,
         cond_emb_dim: int = 256,
+        fingerprint_input_dim: int = 768,  # MoLFormer uses 768, Morgan uses 1024
     ):
         self.image_size = image_size
         self.in_channels = in_channels
@@ -1116,7 +1370,7 @@ class ImageDDPM:
         # Perturbation encoder
         if conditional:
             self.perturbation_encoder = PerturbationEncoder(
-                input_dim=1024, output_dim=cond_emb_dim
+                input_dim=fingerprint_input_dim, output_dim=cond_emb_dim
             ).to(self.device)
             self.optimizer.add_param_group({'params': self.perturbation_encoder.parameters()})
         else:
@@ -1139,6 +1393,19 @@ class ImageDDPM:
         sqrt_one_minus_alpha_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1)
         
         return sqrt_alpha_t * x0 + sqrt_one_minus_alpha_t * noise
+    
+    def predict_x0_from_noise(self, x_t, t, noise):
+        """
+        Reconstruct x0 (clean image) from x_t and predicted noise.
+        Essential for Bio-Perceptual Loss which needs to 'see' the cell.
+        """
+        sqrt_recip_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod).to(self.device)
+        sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / self.alphas_cumprod - 1).to(self.device)
+        
+        sqrt_recip_alphas_cumprod_t = sqrt_recip_alphas_cumprod[t].view(-1, 1, 1, 1)
+        sqrt_recipm1_alphas_cumprod_t = sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1, 1)
+        
+        return sqrt_recip_alphas_cumprod_t * x_t - sqrt_recipm1_alphas_cumprod_t * noise
     
     def train_step(
         self,
@@ -1300,6 +1567,8 @@ class ImageESTrainer:
         self.lr = lr
         self.device = torch.device(device)
         self.use_bio_loss = use_bio_loss
+        # [NEW] Initialize Bio-Perceptual Loss
+        self.bio_perceptual_loss = BioPerceptualLoss(device)
     
     def compute_fitness(
         self,
@@ -1338,20 +1607,25 @@ class ImageESTrainer:
             if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
                 return -float('inf')
             
-            # 1. Base MSE Loss (Reconstruction)
-            loss = F.mse_loss(noise_pred, noise)
+            # 1. Standard MSE Loss (Pixel fidelity)
+            mse_loss = F.mse_loss(noise_pred, noise)
             
-            # 2. [NEW] Biological Consistency Loss (DNA Preservation)
-            # Channel 0 is DAPI (DNA/Nucleus). We enforce that the nucleus noise 
-            # matches the ground truth more strictly than the cytoskeleton.
-            if self.use_bio_loss:
-                dna_loss = F.mse_loss(noise_pred[:, 0, :, :], noise[:, 0, :, :])
-                loss = loss + 0.1 * dna_loss  # 0.1 weight matches PPO settings
+            # 2. [NEW] Bio-Perceptual Loss (Style/Texture fidelity)
+            # We must reconstruct x0 because DINO works on images, not noise
+            pred_x0 = self.ddpm.predict_x0_from_noise(x_t, t, noise_pred)
+            # Clamp to valid image range [-1, 1] for stability
+            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
             
-            if torch.isnan(loss) or torch.isinf(loss):
+            perceptual_loss = self.bio_perceptual_loss(pred_x0, x_batch)
+            
+            # Weighted Sum: 1.0 MSE + 0.1 Perceptual
+            # 0.1 is standard for perceptual losses (LPIPS/DINO) to prevent artifacts
+            total_loss = mse_loss + 0.1 * perceptual_loss
+            
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
                 return -float('inf')
         
-        return -loss.item()
+        return -total_loss.item()
     
     def train_step(
         self,
@@ -1452,6 +1726,9 @@ class ImagePPOTrainer:
         self.device = torch.device(device)
         self.use_bio_loss = use_bio_loss  # Store the flag
         
+        # [NEW] Initialize Bio-Perceptual Loss
+        self.bio_perceptual_loss = BioPerceptualLoss(device)
+        
         # Freeze pretrained model
         self.pretrain_model.model.eval()
         for p in self.pretrain_model.model.parameters():
@@ -1501,8 +1778,20 @@ class ImagePPOTrainer:
         
         kl_loss = F.mse_loss(noise_pred_cond, noise_pred_pretrain)
         
-        # Base loss
-        total_loss = reconstruction_loss + self.kl_weight * kl_loss
+        # 1. MSE Loss
+        # reconstruction_loss already computed above
+        
+        # 2. [NEW] Bio-Perceptual Loss
+        pred_x0 = self.cond_model.predict_x0_from_noise(x_t, t, noise_pred_cond)
+        pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+        perceptual_loss = self.bio_perceptual_loss(pred_x0, x_batch)
+        
+        # 3. KL Penalty (divergence from pretrained)
+        # kl_loss already computed above
+        
+        # TOTAL LOSS
+        # Added 0.1 * perceptual_loss
+        total_loss = reconstruction_loss + 0.1 * perceptual_loss + self.kl_weight * kl_loss
         
         # Conditional Biological Consistency Loss (MoA Regularization)
         # Ensures DNA channel (channel 0 = DAPI) is preserved - prevents hallucinating new cell locations
@@ -2150,6 +2439,7 @@ class BBBC021AblationRunner:
             device=self.config.device,
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
+            fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
         )
         
         # Try to load checkpoint
@@ -2245,6 +2535,7 @@ class BBBC021AblationRunner:
             device=self.config.device,
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
+            fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
         )
         
         # Weight transfer: Both models are now conditional, so architectures match
@@ -3609,9 +3900,10 @@ Learned Statistics:
         if not end_smiles:
             end_smiles = end_compound
         
-        # Get Latent Vectors (Fingerprints)
-        fp_start = torch.tensor(self.train_dataset.morgan_encoder.encode(start_smiles)).to(self.config.device)
-        fp_end = torch.tensor(self.train_dataset.morgan_encoder.encode(end_smiles)).to(self.config.device)
+        # Get Latent Vectors (Chemical Embeddings)
+        # MoLFormerEncoder.encode returns a tensor, so we don't need torch.tensor
+        fp_start = self.train_dataset.chem_encoder.encode([start_smiles]).squeeze(0).to(self.config.device)
+        fp_end = self.train_dataset.chem_encoder.encode([end_smiles]).squeeze(0).to(self.config.device)
         
         # 2. Get a real control image (Source)
         # Find first start_compound image in validation set
