@@ -1879,7 +1879,18 @@ class BBBC021AblationRunner:
         print("\n" + "=" * 60)
         print("FINAL PRETRAINING BASELINE (Stage 1 & 2 Complete)")
         print("=" * 60)
-        if best_pretrain_metrics['fid'] != float('inf'):
+        
+        # Try to load from latest CSV first (more reliable for resumed runs)
+        csv_metrics = self._load_latest_metrics_from_csv(self.plots_dir, 'Pretraining')
+        
+        if csv_metrics:
+            # Use CSV metrics (most recent data)
+            print(f"Best Epoch: {int(csv_metrics.get('epoch', 0))}")
+            print(f"Best FID:   {csv_metrics.get('fid', 0.0):.2f}")
+            print(f"Baseline KL: {csv_metrics.get('kl_div_total', 0.0):.4f}")
+            print(f"Final Loss:  {csv_metrics.get('loss', 0.0):.4f}")
+        elif best_pretrain_metrics['fid'] != float('inf'):
+            # Fallback to in-memory metrics (current session)
             print(f"Best Epoch: {best_pretrain_metrics['epoch']}")
             print(f"Best FID:   {best_pretrain_metrics['fid']:.2f}")
             print(f"Baseline KL: {best_pretrain_metrics['kl']:.4f}")
@@ -2721,23 +2732,98 @@ class BBBC021AblationRunner:
         
         return metrics
     
+    def _load_latest_metrics_from_csv(self, checkpoint_dir: str, method: str) -> Optional[Dict]:
+        """
+        Load the latest metrics from the most recent CSV file.
+        Returns the row with the best (lowest) FID score, or None if no CSV found.
+        """
+        # Find all CSV files for this method
+        base_pattern = f"{method}_metrics"
+        csv_files = []
+        
+        # Check for base file
+        base_path = os.path.join(checkpoint_dir, f"{base_pattern}.csv")
+        if os.path.exists(base_path):
+            csv_files.append((0, base_path))  # 0 means base file (oldest)
+        
+        # Check for versioned files
+        counter = 1
+        while True:
+            versioned_path = os.path.join(checkpoint_dir, f"{base_pattern}_{counter}.csv")
+            if os.path.exists(versioned_path):
+                csv_files.append((counter, versioned_path))
+                counter += 1
+            else:
+                break
+        
+        if not csv_files:
+            return None
+        
+        # Get the latest file (highest counter, or base if no versions)
+        csv_files.sort(key=lambda x: x[0], reverse=True)
+        latest_file = csv_files[0][1]
+        
+        # Read the CSV and find the best FID
+        try:
+            with open(latest_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                
+                if not rows:
+                    return None
+                
+                # Find row with best (lowest) FID
+                best_row = None
+                best_fid = float('inf')
+                
+                for row in rows:
+                    try:
+                        fid = float(row.get('fid', float('inf')))
+                        if fid < best_fid:
+                            best_fid = fid
+                            best_row = row
+                    except (ValueError, TypeError):
+                        continue
+                
+                if best_row:
+                    # Convert string values to appropriate types
+                    result = {}
+                    for key, value in best_row.items():
+                        try:
+                            # Try to convert to float first
+                            result[key] = float(value)
+                        except (ValueError, TypeError):
+                            try:
+                                # Try int
+                                result[key] = int(value)
+                            except (ValueError, TypeError):
+                                # Keep as string
+                                result[key] = value
+                    
+                    return result
+        except Exception as e:
+            print(f"Warning: Failed to read metrics from CSV {latest_file}: {e}")
+        
+        return None
+    
     def _save_metrics_to_csv(self, metrics: List[Dict], checkpoint_dir: str, method: str, config_str: str = ""):
         """
         Save metrics to CSV with smart versioning. 
-        If resuming, it creates a new file (e.g., _1.csv, _2.csv) instead of overwriting the old one.
+        Creates a NEW file for every new run session (e.g. _1.csv, _2.csv)
+        to prevent mixing data or overwriting old runs.
         """
         if not metrics:
             return
         
-        # 1. Create a unique key for this specific context (folder + stage/method)
+        # 1. Session Key (Unique per stage/method in this folder)
         session_key = os.path.join(checkpoint_dir, method)
 
-        # 2. Determine the filename (Only do this ONCE per run session)
+        # 2. Determine Filename (ONCE per runtime session)
         if session_key not in self._session_csv_paths:
             base_name = f"{method}_metrics.csv"
             file_path = os.path.join(checkpoint_dir, base_name)
             
-            # If the default file exists, find the next available counter
+            # If default file exists, increment counter until we find a free name
             if os.path.exists(file_path):
                 counter = 1
                 while True:
@@ -2745,24 +2831,31 @@ class BBBC021AblationRunner:
                     new_path = os.path.join(checkpoint_dir, new_name)
                     if not os.path.exists(new_path):
                         file_path = new_path
-                        print(f"  [Log] Previous metrics found. Creating new session file: {os.path.basename(file_path)}")
+                        print(f"  [Log] Creating NEW metrics file for this session: {os.path.basename(file_path)}")
                         break
                     counter += 1
             
-            # Store this decision so we keep writing to this specific file for the rest of the run
+            # Cache the path so we use the SAME file for the rest of this run
             self._session_csv_paths[session_key] = file_path
 
-        # 3. Retrieve the assigned path
         final_path = self._session_csv_paths[session_key]
         
-        # 4. Write data
-        # We use 'w' mode to overwrite the file *with the growing list* from this session.
-        fieldnames = list(metrics[0].keys())
+        # 3. Write Data (Append Mode)
+        # We append because we might call this multiple times in one session (e.g. per epoch)
+        file_exists = os.path.exists(final_path)
+        mode = 'a' if file_exists else 'w'
         
+        # Ensure 'epoch' is the first column if present
+        keys = list(metrics[0].keys())
+        if 'epoch' in keys:
+            keys.remove('epoch')
+            keys.insert(0, 'epoch')
+            
         try:
-            with open(final_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
+            with open(final_path, mode, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=keys)
+                if not file_exists:
+                    writer.writeheader()
                 writer.writerows(metrics)
         except Exception as e:
             print(f"Warning: Failed to save metrics to CSV: {e}")
