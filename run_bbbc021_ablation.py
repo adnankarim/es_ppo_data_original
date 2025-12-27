@@ -2196,45 +2196,62 @@ class BBBC021AblationRunner:
         print(f"Val samples: {len(self.val_dataset)}")
     
     def _load_checkpoint_if_exists(self, model, optimizer, filename, skip_optimizer=False):
-        """Attempts to load a checkpoint. Returns epoch number.
-        
-        Args:
-            model: Model to load weights into
-            optimizer: Optimizer to load state into (optional)
-            filename: Checkpoint filename to load
-            skip_optimizer: If True, don't load optimizer state (useful when changing LR)
         """
-        # Check global first for pretraining
+        Attempts to load a checkpoint. Returns epoch number.
+        HANDLES DIMENSION MISMATCHES AUTOMATICALLY (Fixes the crash).
+        """
+        # 1. Determine path (Global vs Local)
         if "pretrain" in filename and not self.config.force_pretrain:
-            global_path = os.path.join(self.config.global_model_dir, "ddpm_base_latest.pt")
-            if os.path.exists(global_path):
-                print(f"Loading GLOBAL pretrain checkpoint: {global_path}")
-                ckpt = torch.load(global_path, map_location=self.config.device)
-                model.model.load_state_dict(ckpt['model_state_dict'])
-                # Only load optimizer if we are RESUMING pretraining and not skipping
-                if self.config.resume_pretrain and optimizer and 'optimizer_state_dict' in ckpt and not skip_optimizer:
-                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                    return ckpt.get('epoch', 0)
-                elif skip_optimizer:
-                    print("  Note: Skipping optimizer state (new learning rate will be used)")
-                # If not resuming, check if model is complete
-                if ckpt.get('epoch', 0) >= self.config.ddpm_epochs:
-                    return self.config.ddpm_epochs  # Return max epochs so we skip training
-                return 0  # Model exists but incomplete, will train from start
+            path = os.path.join(self.config.global_model_dir, "ddpm_base_latest.pt")
+            is_global = True
+        else:
+            path = os.path.join(self.models_dir, filename)
+            is_global = False
 
-        # Check local run dir
-        local_path = os.path.join(self.models_dir, filename)
-        if os.path.exists(local_path):
-            print(f"Loading LOCAL checkpoint: {local_path}")
-            ckpt = torch.load(local_path, map_location=self.config.device)
-            model.model.load_state_dict(ckpt['model_state_dict'])
+        if not os.path.exists(path):
+            return 0
+
+        print(f"Loading checkpoint: {path}")
+        try:
+            ckpt = torch.load(path, map_location=self.config.device)
+            
+            # 2. Attempt to load weights
+            # strict=True ensures we catch mismatches immediately
+            model.model.load_state_dict(ckpt['model_state_dict'], strict=True)
+            
+            # 2b. Attempt to load perturbation encoder (if exists and model is conditional)
+            # This is where the dimension mismatch will occur (1024 vs 768 input dim)
+            if model.perturbation_encoder is not None and 'perturbation_encoder_state_dict' in ckpt:
+                model.perturbation_encoder.load_state_dict(ckpt['perturbation_encoder_state_dict'], strict=True)
+            
+            # 3. Load Optimizer (if applicable)
             if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None and not skip_optimizer:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                except ValueError:
+                    print("  Warning: Optimizer param groups mismatch. Skipping optimizer load.")
             elif skip_optimizer:
                 print("  Note: Skipping optimizer state (new learning rate will be used)")
+                
+            # 4. Check if pretraining is already done
+            if is_global and ckpt.get('epoch', 0) >= self.config.ddpm_epochs:
+                return self.config.ddpm_epochs
+                
             return ckpt.get('epoch', 0)
-        
-        return 0
+
+        except RuntimeError as e:
+            # 5. CATCH DIMENSION MISMATCH (The Fix)
+            if "size mismatch" in str(e):
+                print("\n" + "!" * 60)
+                print("ARCHITECTURAL CHANGE DETECTED!")
+                print("The saved checkpoint has different dimensions than the current config.")
+                print("Likely cause: Switched from Morgan (256 dim) to MoLFormer (768 dim).")
+                print("Action: IGNORING old checkpoint and restarting training from scratch.")
+                print("!" * 60 + "\n")
+                return 0  # Start from scratch (Epoch 0)
+            else:
+                # If it's some other real error, raise it
+                raise e
 
     def _save_checkpoint(self, model, optimizer, epoch, filename, is_global=False):
         """Save checkpoint for model and optimizer."""
