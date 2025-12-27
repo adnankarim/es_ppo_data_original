@@ -2021,7 +2021,7 @@ class BBBC021AblationRunner:
         return stats
     
     def _pretrain_ddpm(self) -> Tuple[ImageDDPM, Dict]:
-        """[FIXED] Conditional Marginal Pretraining with Smart Resume Logic & Best Metric Tracking."""
+        """[FIXED] Conditional Marginal Pretraining with INCREMENTAL Logic."""
         # 1. Initialize Conditional Model
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
@@ -2038,23 +2038,20 @@ class BBBC021AblationRunner:
         # Try to load checkpoint
         start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
         
-        # --- TRACKING BEST METRICS ---
+        # --- NEW INCREMENTAL LOGIC ---
+        # The argument --ddpm-epochs now means "How many epochs to train THIS SESSION"
+        epochs_to_train = self.config.ddpm_epochs
+        target_epoch = start_epoch + epochs_to_train
+        
+        # Track best metrics
         best_metrics = {'fid': float('inf'), 'kl': 0.0, 'loss': 0.0, 'epoch': 0}
 
-        # --- SMART RESUME LOGIC ---
-        target_epoch = self.config.ddpm_epochs
-        
-        if start_epoch > target_epoch:
-            print(f"  [Smart Resume] Current Epoch ({start_epoch}) > Config Epochs ({target_epoch}).")
-            print(f"  [Smart Resume] Switching to INCREMENTAL mode: Training for +{target_epoch} extra epochs.")
-            target_epoch = start_epoch + target_epoch
-            
-        elif start_epoch == target_epoch:
-            print(f"  [Smart Resume] Model already reached target epoch {target_epoch}. Skipping Pretraining.")
-            # If skipping, try to load metrics from the last log or return placeholder
+        if epochs_to_train <= 0:
+            print(f"  [Incremental] Epochs set to {epochs_to_train}. Skipping training.")
             return ddpm, best_metrics
 
-        print(f"  Training Conditional DDPM from Epoch {start_epoch+1} to {target_epoch}...")
+        print(f"  [Incremental] Resuming from Epoch {start_epoch}. Training for {epochs_to_train} epochs.")
+        print(f"  [Incremental] Target Epoch: {target_epoch}")
 
         # 2. Use Full Dataset
         dataloader = DataLoader(
@@ -2077,14 +2074,9 @@ class BBBC021AblationRunner:
                 images = batch['image'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
-                # Conditional Training with zero-control
                 dummy_control = torch.zeros_like(images)
                 
-                loss = ddpm.train_step(
-                    x0=images, 
-                    control=dummy_control, 
-                    fingerprint=fingerprint
-                )
+                loss = ddpm.train_step(x0=images, control=dummy_control, fingerprint=fingerprint)
                 epoch_losses.append(loss)
             
             avg_loss = np.mean(epoch_losses)
@@ -2167,29 +2159,34 @@ class BBBC021AblationRunner:
         lr: float,
         config_idx: int,
     ) -> Dict:
-        """Run single ES experiment with Resume capability."""
+        """Run single ES experiment with INCREMENTAL Resume capability."""
         cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
         
-        # --- RESUME LOGIC START ---
         checkpoint_name = f'ES_config_{config_idx}_latest.pt'
         # ES doesn't have a standard optimizer in the trainer, so we pass None
         start_epoch = self._load_checkpoint_if_exists(cond_ddpm, None, checkpoint_name, skip_optimizer=self.config.skip_optimizer_on_resume)
         
-        # Check if Warmup is needed or already done
-        run_warmup = True
-        warmup_start_epoch = 0
-        es_start_epoch = 0
+        # --- INCREMENTAL LOGIC ---
+        epochs_to_train = self.config.coupling_epochs
         
-        if start_epoch >= self.config.warmup_epochs:
-            # We are resuming past warmup, skip to ES phase
-            run_warmup = False
-            es_start_epoch = start_epoch - self.config.warmup_epochs
-            print(f"  Resuming ES Config {config_idx} from ES Epoch {es_start_epoch} (warmup already complete)")
-        elif start_epoch > 0:
-            # Resuming during warmup
-            warmup_start_epoch = start_epoch
-            print(f"  Resuming ES Config {config_idx} from Warmup Epoch {warmup_start_epoch}")
-        # --- RESUME LOGIC END ---
+        # Logic: If we are still in warmup, finish warmup first, THEN do the requested ES epochs
+        # If we are past warmup, just do the requested ES epochs
+        
+        run_warmup = False
+        warmup_start = 0
+        
+        if start_epoch < self.config.warmup_epochs:
+            run_warmup = True
+            warmup_start = start_epoch
+            # If resuming during warmup, we finish warmup, then run the full requested ES epochs
+            es_start_epoch = self.config.warmup_epochs
+            es_target_epoch = es_start_epoch + epochs_to_train
+            print(f"  [Incremental] Resuming during Warmup (Epoch {start_epoch}). Will finish warmup then run {epochs_to_train} ES epochs.")
+        else:
+            # Past warmup, just add epochs
+            es_start_epoch = start_epoch
+            es_target_epoch = start_epoch + epochs_to_train
+            print(f"  [Incremental] Resuming ES (Warmup complete). Running {epochs_to_train} additional epochs.")
         
         # Create dataloader
         dataloader = BatchPairedDataLoader(
@@ -2202,8 +2199,8 @@ class BBBC021AblationRunner:
         
         # --- WARMUP PHASE ---
         if run_warmup:
-            print(f"    Warmup phase: {warmup_start_epoch} to {self.config.warmup_epochs} epochs...")
-            for warmup_epoch in range(warmup_start_epoch, self.config.warmup_epochs):
+            print(f"    Warmup phase: {warmup_start} to {self.config.warmup_epochs} epochs...")
+            for warmup_epoch in range(warmup_start, self.config.warmup_epochs):
                 # Reset peak memory stats at start of epoch
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
@@ -2257,7 +2254,9 @@ class BBBC021AblationRunner:
             device=self.config.device,
         )
         
-        for epoch in range(es_start_epoch, self.config.coupling_epochs):
+        print(f"  [Incremental] Starting ES Training: {es_start_epoch} -> {es_target_epoch}")
+
+        for epoch in range(es_start_epoch, es_target_epoch):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -2277,10 +2276,8 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            # Evaluate
             metrics = self._evaluate(cond_ddpm)
-            # Continue epoch numbering from warmup (absolute epoch)
-            metrics['epoch'] = len(epoch_metrics) + 1
+            metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['sigma'] = sigma
             metrics['lr'] = lr
@@ -2313,10 +2310,7 @@ class BBBC021AblationRunner:
                     f'ES/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
             
-            # --- SAVE CHECKPOINT ---
-            # Save "latest" for resuming (absolute epoch includes warmup)
-            current_absolute_epoch = len(epoch_metrics)
-            self._save_checkpoint(cond_ddpm, None, current_absolute_epoch, checkpoint_name)
+            self._save_checkpoint(cond_ddpm, None, epoch + 1, checkpoint_name)
         
         final_metrics = epoch_metrics[-1] if epoch_metrics else {}
         final_metrics['method'] = 'ES'
@@ -2343,12 +2337,11 @@ class BBBC021AblationRunner:
         lr: float,
         config_idx: int,
     ) -> Dict:
-        """Run single PPO experiment with Resume capability."""
+        """Run single PPO experiment with INCREMENTAL Resume capability."""
         cond_ddpm = self._create_conditional_ddpm(pretrain_ddpm)
         
-        # --- RESUME LOGIC START ---
         checkpoint_name = f'PPO_config_{config_idx}_latest.pt'
-        # Initialize trainer first (needed for optimizer state)
+        
         ppo_trainer = ImagePPOTrainer(
             cond_ddpm,
             pretrain_ddpm,
@@ -2359,32 +2352,26 @@ class BBBC021AblationRunner:
             use_bio_loss=self.config.enable_bio_loss,
         )
         
-        # Check if we have a saved state
+        # Load state
         start_epoch = self._load_checkpoint_if_exists(cond_ddpm, ppo_trainer.optimizer, checkpoint_name, skip_optimizer=self.config.skip_optimizer_on_resume)
         
-        if start_epoch >= self.config.coupling_epochs:
-            print(f"  Config {config_idx} already finished. Loading final model and skipping.")
-            # Load the final model to ensure we return the correct metrics
-            final_name = f'PPO_config_{config_idx}_final.pt'
-            final_path = os.path.join(self.models_dir, final_name)
-            if os.path.exists(final_path):
-                cond_ddpm.load(final_path)
-            return self._evaluate(cond_ddpm)  # Return evaluation of finished model
-            
-        if start_epoch > 0:
-            print(f"  Resuming PPO Config {config_idx} from Epoch {start_epoch}")
-        # --- RESUME LOGIC END ---
+        # --- NEW INCREMENTAL LOGIC ---
+        epochs_to_train = self.config.coupling_epochs
+        target_epoch = start_epoch + epochs_to_train
+        
+        print(f"  [Incremental] Resuming PPO Config {config_idx} from Epoch {start_epoch}")
+        print(f"  [Incremental] Training for {epochs_to_train} additional epochs (Target: {target_epoch})")
         
         # Create dataloader
         dataloader = BatchPairedDataLoader(
-            self.train_dataset,
+            self.train_dataset, 
             batch_size=self.config.coupling_batch_size,
             shuffle=True,
         )
         
         epoch_metrics = []
         
-        for epoch in range(start_epoch, self.config.coupling_epochs):
+        for epoch in range(start_epoch, target_epoch):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -2440,22 +2427,17 @@ class BBBC021AblationRunner:
                     f'PPO/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
                 })
             
-            # --- SAVE CHECKPOINT ---
-            # Save "latest" for resuming
+            # Save Checkpoint
             self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name)
         
         final_metrics = epoch_metrics[-1] if epoch_metrics else {}
         final_metrics['method'] = 'PPO'
         final_metrics['history'] = epoch_metrics
         
-        # Generate latent space visualization
+        # Visuals & Benchmarks
         self._plot_latent_clusters(cond_ddpm, 'PPO', config_idx)
-        
-        # Save model for NSCB benchmark
         model_path = os.path.join(self.models_dir, f'PPO_config_{config_idx}_final.pt')
         cond_ddpm.save(model_path)
-        
-        # Run NSCB benchmark
         nscb_results = self.run_nscb_benchmark(cond_ddpm)
         final_metrics.update(nscb_results)
         
