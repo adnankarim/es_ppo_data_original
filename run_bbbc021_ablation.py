@@ -246,6 +246,9 @@ class BBBC021Config:
     image_size: int = 96
     num_channels: int = 3  # DNA, F-actin, β-tubulin
     
+    # Model architecture
+    use_transformer: bool = False  # Use U-ViT Transformer backbone instead of U-Net
+    
     # Perturbation encoding
     morgan_bits: int = 1024  # Morgan fingerprint dimensions
     perturbation_embed_dim: int = 768  # Updated for MoLFormer (ChemBERTa uses 768)
@@ -1313,11 +1316,167 @@ class PerturbationEncoder(nn.Module):
 
 
 # ============================================================================
+# U-ViT TRANSFORMER BACKBONE
+# ============================================================================
+
+class PatchEmbed(nn.Module):
+    """Converts 96x96 image into sequence of patches."""
+    def __init__(self, img_size=96, patch_size=4, in_chans=6, embed_dim=512):
+        super().__init__()
+        self.num_patches = (img_size // patch_size) ** 2
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)  # (B, Embed, H/P, W/P)
+        x = x.flatten(2).transpose(1, 2)  # (B, NumPatches, Embed)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Standard DiT/ViT Block with AdaLN (Adaptive Layer Norm) for conditioning."""
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Linear(mlp_hidden_dim, dim),
+        )
+        
+        # AdaLN: Regress scale/shift from condition vector (Time + Drug)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 6 * dim)  # scale/shift for norm1, scale/shift for norm2, scale for attn, scale for mlp
+        )
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        
+        # Self-Attention
+        x_norm = (1 + scale_msa.unsqueeze(1)) * self.norm1(x) + shift_msa.unsqueeze(1)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        
+        # MLP
+        x_norm2 = (1 + scale_mlp.unsqueeze(1)) * self.norm2(x) + shift_mlp.unsqueeze(1)
+        mlp_out = self.mlp(x_norm2)
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
+        
+        return x
+
+
+class UViT(nn.Module):
+    """
+    U-shaped Vision Transformer.
+    Replaces the CNN U-Net.
+    Input: (B, 6, 96, 96) -> Output: (B, 3, 96, 96)
+    """
+    def __init__(self, 
+                 img_size=96, 
+                 in_channels=3,  # 3 for noise + 3 for control = 6 total
+                 patch_size=4, 
+                 embed_dim=512, 
+                 depth=12,  # Number of transformer blocks
+                 num_heads=8,
+                 cond_emb_dim=768,  # MoLFormer dim
+                 time_emb_dim=256
+                ):
+        super().__init__()
+        
+        self.in_channels = in_channels * 2  # Noise + Control
+        self.patch_size = patch_size
+        
+        # 1. Patch Embedding
+        self.patch_embed = PatchEmbed(img_size, patch_size, self.in_channels, embed_dim)
+        num_patches = self.patch_embed.num_patches
+        
+        # Positional Embedding (Learnable)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        
+        # 2. Time & Drug Embedding
+        self.time_embed = nn.Sequential(
+            SinusoidalPositionEmbeddings(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.drug_embed = nn.Sequential(
+            nn.Linear(cond_emb_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        
+        # 3. Transformer Layers (U-Shape)
+        # We split depth into Encoder (down), Mid, Decoder (up)
+        # But U-ViT keeps resolution constant and uses skip connections
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(depth)
+        ])
+        
+        # Skip connections connect layer i to layer (depth - 1 - i)
+        self.skip_connections = nn.ModuleList([
+            nn.Linear(embed_dim, embed_dim) for _ in range(depth // 2)
+        ])
+        
+        # 4. Final Output (Unpatchify)
+        self.final_norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        self.final_proj = nn.Linear(embed_dim, patch_size * patch_size * 3)  # Output 3 channels (RGB)
+
+    def forward(self, x, t, control, perturbation_emb):
+        # x: (B, 3, 96, 96), control: (B, 3, 96, 96)
+        
+        # 1. Input Setup
+        x_in = torch.cat([x, control], dim=1)  # (B, 6, 96, 96)
+        x = self.patch_embed(x_in)  # (B, N, D)
+        x = x + self.pos_embed
+        
+        # 2. Condition Setup
+        t_emb = self.time_embed(t)
+        c_emb = self.drug_embed(perturbation_emb)
+        cond = t_emb + c_emb  # Combine time and drug
+        
+        # 3. U-ViT Processing
+        skips = []
+        depth = len(self.blocks)
+        
+        # Encoder Half
+        for i in range(depth // 2):
+            x = self.blocks[i](x, cond)
+            skips.append(x)
+            
+        # Decoder Half
+        for i in range(depth // 2, depth):
+            # Add Skip Connection
+            skip_feat = skips.pop()
+            # Linear projection for skip consistency (optional but recommended)
+            skip_feat = self.skip_connections[depth - 1 - i](skip_feat)
+            x = x + skip_feat
+            
+            x = self.blocks[i](x, cond)
+            
+        # 4. Final Projection
+        x = self.final_norm(x)
+        x = self.final_proj(x)  # (B, N, P*P*3)
+        
+        # Unpatchify to (B, 3, 96, 96)
+        B, N, _ = x.shape
+        H = W = 96
+        P = self.patch_size
+        x = x.view(B, H // P, W // P, P, P, 3)
+        x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, 3, H, W)
+        
+        return x
+
+
+# ============================================================================
 # DDPM FOR IMAGES
 # ============================================================================
 
 class ImageDDPM:
-    """DDPM for image generation with U-Net backbone."""
+    """DDPM for image generation with U-Net or U-ViT Transformer backbone."""
     
     def __init__(
         self,
@@ -1333,12 +1492,14 @@ class ImageDDPM:
         conditional: bool = False,
         cond_emb_dim: int = 256,
         fingerprint_input_dim: int = 768,  # MoLFormer uses 768, Morgan uses 1024
+        use_transformer: bool = False,  # Use U-ViT instead of U-Net
     ):
         self.image_size = image_size
         self.in_channels = in_channels
         self.timesteps = timesteps
         self.device = torch.device(device)
         self.conditional = conditional
+        self.use_transformer = use_transformer
         
         # Beta schedule
         betas = torch.linspace(beta_start, beta_end, timesteps)
@@ -1348,7 +1509,20 @@ class ImageDDPM:
         self.register_schedule(betas, alphas, alphas_cumprod)
         
         # Model
-        if conditional:
+        if use_transformer and conditional:
+            # Use U-ViT Transformer backbone
+            self.model = UViT(
+                img_size=image_size,
+                in_channels=in_channels,
+                patch_size=4,
+                embed_dim=512,  # Tune this for GPU memory (256, 512, 768)
+                depth=12,
+                num_heads=8,
+                cond_emb_dim=cond_emb_dim,
+                time_emb_dim=time_emb_dim
+            ).to(self.device)
+        elif conditional:
+            # Use U-Net backbone
             self.model = ConditionalUNet(
                 in_channels=in_channels,
                 out_channels=in_channels,
@@ -1357,6 +1531,7 @@ class ImageDDPM:
                 cond_emb_dim=cond_emb_dim,
             ).to(self.device)
         else:
+            # Unconditional U-Net
             self.model = UNet(
                 in_channels=in_channels,
                 out_channels=in_channels,
@@ -2458,6 +2633,7 @@ class BBBC021AblationRunner:
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
             fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
+            use_transformer=self.config.use_transformer,
         )
         
         # Try to load checkpoint
@@ -2554,6 +2730,7 @@ class BBBC021AblationRunner:
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
             fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
+            use_transformer=self.config.use_transformer,
         )
         
         # Weight transfer: Both models are now conditional, so architectures match
@@ -4052,6 +4229,8 @@ def main():
     # Model
     parser.add_argument("--no-reuse-pretrained", action="store_true",
                        help="Train pretrained model from scratch")
+    parser.add_argument("--use-transformer", action="store_true",
+                       help="Use U-ViT Transformer backbone instead of U-Net (better for global coordination)")
     
     # Biological constraints
     parser.add_argument("--enable-bio-loss", action="store_true",
@@ -4089,6 +4268,7 @@ def main():
         use_wandb=args.use_wandb,
         seed=args.seed,
         reuse_pretrained=not args.no_reuse_pretrained,
+        use_transformer=args.use_transformer,
         enable_bio_loss=args.enable_bio_loss,
     )
     
