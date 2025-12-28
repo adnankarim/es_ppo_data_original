@@ -2198,7 +2198,13 @@ class BBBC021AblationRunner:
     def _load_checkpoint_if_exists(self, model, optimizer, filename, skip_optimizer=False):
         """
         Attempts to load a checkpoint. Returns epoch number.
-        HANDLES DIMENSION MISMATCHES AUTOMATICALLY (Fixes the crash).
+        HANDLES DIMENSION MISMATCHES AUTOMATICALLY.
+        
+        Args:
+            model: Model to load weights into
+            optimizer: Optimizer to load state into (optional)
+            filename: Checkpoint filename to load
+            skip_optimizer: If True, don't load optimizer state (useful when changing LR)
         """
         # 1. Determine path (Global vs Local)
         if "pretrain" in filename and not self.config.force_pretrain:
@@ -2219,11 +2225,6 @@ class BBBC021AblationRunner:
             # strict=True ensures we catch mismatches immediately
             model.model.load_state_dict(ckpt['model_state_dict'], strict=True)
             
-            # 2b. Attempt to load perturbation encoder (if exists and model is conditional)
-            # This is where the dimension mismatch will occur (1024 vs 768 input dim)
-            if model.perturbation_encoder is not None and 'perturbation_encoder_state_dict' in ckpt:
-                model.perturbation_encoder.load_state_dict(ckpt['perturbation_encoder_state_dict'], strict=True)
-            
             # 3. Load Optimizer (if applicable)
             if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None and not skip_optimizer:
                 try:
@@ -2240,17 +2241,17 @@ class BBBC021AblationRunner:
             return ckpt.get('epoch', 0)
 
         except RuntimeError as e:
-            # 5. CATCH DIMENSION MISMATCH (The Fix)
-            if "size mismatch" in str(e):
+            # 5. CATCH DIMENSION MISMATCH
+            if "size mismatch" in str(e) or "Missing key" in str(e) or "Unexpected key" in str(e):
                 print("\n" + "!" * 60)
                 print("ARCHITECTURAL CHANGE DETECTED!")
                 print("The saved checkpoint has different dimensions than the current config.")
-                print("Likely cause: Switched from Morgan (256 dim) to MoLFormer (768 dim).")
-                print("Action: IGNORING old checkpoint and restarting training from scratch.")
+                print("Likely cause: Switched from Morgan (1024->256 dim) to MoLFormer (768->256 dim).")
+                print("Action: IGNORING checkpoint and restarting training from scratch.")
                 print("!" * 60 + "\n")
-                return 0  # Start from scratch (Epoch 0)
+                return 0  # Start from scratch
             else:
-                # If it's some other real error, raise it
+                # If it's some other error, raise it
                 raise e
 
     def _save_checkpoint(self, model, optimizer, epoch, filename, is_global=False):
