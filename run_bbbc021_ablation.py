@@ -249,6 +249,10 @@ class BBBC021Config:
     # Model architecture
     use_transformer: bool = False  # Use U-ViT Transformer backbone instead of U-Net
     
+    # CFG Settings (Matches DDMEC Paper)
+    cfg_dropout_prob: float = 0.1  # 10% chance to drop condition during training
+    guidance_scale: float = 4.0    # Inference strength (try 2.0 - 7.0)
+    
     # Perturbation encoding
     morgan_bits: int = 1024  # Morgan fingerprint dimensions
     perturbation_embed_dim: int = 768  # Updated for MoLFormer (ChemBERTa uses 768)
@@ -1493,6 +1497,7 @@ class ImageDDPM:
         cond_emb_dim: int = 256,
         fingerprint_input_dim: int = 768,  # MoLFormer uses 768, Morgan uses 1024
         use_transformer: bool = False,  # Use U-ViT instead of U-Net
+        cfg_dropout_prob: float = 0.1,  # CFG dropout probability during training
     ):
         self.image_size = image_size
         self.in_channels = in_channels
@@ -1500,6 +1505,7 @@ class ImageDDPM:
         self.device = torch.device(device)
         self.conditional = conditional
         self.use_transformer = use_transformer
+        self.cfg_dropout_prob = cfg_dropout_prob
         
         # Beta schedule
         betas = torch.linspace(beta_start, beta_end, timesteps)
@@ -1609,9 +1615,19 @@ class ImageDDPM:
         # Forward diffusion
         x_t = self.q_sample(x0, t, noise)
         
-        # Predict noise
+        # Predict noise with CFG dropout
         if self.conditional:
             perturbation_emb = self.perturbation_encoder(fingerprint)
+            
+            # Randomly drop condition with probability cfg_dropout_prob (CFG Training)
+            if self.cfg_dropout_prob > 0:
+                # Create a mask (1 = keep, 0 = drop)
+                mask = (torch.rand(batch_size, device=self.device) > self.cfg_dropout_prob).float()
+                # Expand mask to match embedding shape (B, dim)
+                mask = mask.unsqueeze(1)
+                # Apply mask (Zero out dropped embeddings)
+                perturbation_emb = perturbation_emb * mask
+                
             noise_pred = self.model(x_t, t, control, perturbation_emb)
         else:
             noise_pred = self.model(x_t, t)
@@ -1634,8 +1650,9 @@ class ImageDDPM:
         control: Optional[torch.Tensor] = None,
         fingerprint: Optional[torch.Tensor] = None,
         num_steps: int = None,
+        guidance_scale: float = 4.0,  # CFG guidance scale
     ) -> torch.Tensor:
-        """Sample from the model."""
+        """Sample from the model with Classifier-Free Guidance."""
         self.model.eval()
         
         if num_steps is None:
@@ -1644,11 +1661,15 @@ class ImageDDPM:
         # Start from noise
         x = torch.randn(num_samples, self.in_channels, self.image_size, self.image_size, device=self.device)
         
-        # Prepare condition
+        # Prepare embeddings for CFG
         if self.conditional and fingerprint is not None:
-            perturbation_emb = self.perturbation_encoder(fingerprint)
+            # 1. Conditional Embedding
+            cond_emb = self.perturbation_encoder(fingerprint)
+            # 2. Unconditional Embedding (Zeros)
+            uncond_emb = torch.zeros_like(cond_emb)
         else:
-            perturbation_emb = None
+            cond_emb = None
+            uncond_emb = None
         
         # Reverse diffusion
         step_size = self.timesteps // num_steps
@@ -1656,9 +1677,20 @@ class ImageDDPM:
         for i in reversed(range(0, self.timesteps, step_size)):
             t = torch.full((num_samples,), i, device=self.device, dtype=torch.long)
             
-            # Predict noise
-            if self.conditional:
-                noise_pred = self.model(x, t, control, perturbation_emb)
+            # Predict noise with CFG extrapolation
+            if self.conditional and guidance_scale > 1.0:
+                # A. Conditional Pass
+                noise_cond = self.model(x, t, control, cond_emb)
+                
+                # B. Unconditional Pass
+                noise_uncond = self.model(x, t, control, uncond_emb)
+                
+                # C. Extrapolate (CFG Formula)
+                # noise = noise_uncond + s * (noise_cond - noise_uncond)
+                noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            elif self.conditional:
+                # Standard conditional sampling (s=1.0)
+                noise_pred = self.model(x, t, control, cond_emb)
             else:
                 noise_pred = self.model(x, t)
             
@@ -2634,6 +2666,7 @@ class BBBC021AblationRunner:
             cond_emb_dim=self.config.perturbation_embed_dim,
             fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
             use_transformer=self.config.use_transformer,
+            cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
         # Try to load checkpoint
@@ -2731,6 +2764,7 @@ class BBBC021AblationRunner:
             cond_emb_dim=self.config.perturbation_embed_dim,
             fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
             use_transformer=self.config.use_transformer,
+            cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
         # Weight transfer: Both models are now conditional, so architectures match
@@ -3090,7 +3124,7 @@ class BBBC021AblationRunner:
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
                 # Generate
-                gen = cond_ddpm.sample(len(control), control, fingerprint, num_steps=self.config.num_sampling_steps)
+                gen = cond_ddpm.sample(len(control), control, fingerprint, num_steps=self.config.num_sampling_steps, guidance_scale=self.config.guidance_scale)
                 
                 all_real.append(perturbed.cpu().numpy())
                 all_fake.append(gen.cpu().numpy())
@@ -3172,7 +3206,8 @@ class BBBC021AblationRunner:
                 # Generate
                 generated = cond_ddpm.sample(
                     len(control), control, fingerprint, 
-                    num_steps=self.config.num_sampling_steps
+                    num_steps=self.config.num_sampling_steps,
+                    guidance_scale=self.config.guidance_scale
                 )
                 
                 # Store (CPU)
@@ -3315,7 +3350,8 @@ class BBBC021AblationRunner:
                         len(images), 
                         control=dummy_control,
                         fingerprint=fingerprints,
-                        num_steps=self.config.num_sampling_steps
+                        num_steps=self.config.num_sampling_steps,
+                        guidance_scale=self.config.guidance_scale
                     )
                     fake_images.append(generated.cpu().numpy())
         
@@ -3870,6 +3906,7 @@ Learned Statistics:
                 gen = cond_ddpm.sample(
                     len(control), control, fingerprint,
                     num_steps=self.config.num_sampling_steps,
+                    guidance_scale=self.config.guidance_scale
                 )
                 fake_img = gen.cpu().numpy()
                 
@@ -4000,6 +4037,7 @@ Learned Statistics:
                 generated = cond_ddpm.sample(
                     len(control), control, fingerprint,
                     num_steps=self.config.num_sampling_steps,
+                    guidance_scale=self.config.guidance_scale
                 )
                 fake_feat = generated.cpu().numpy().reshape(len(generated), -1)
                 fake_features.append(fake_feat)
@@ -4117,7 +4155,7 @@ Learned Statistics:
                 fp_interp = (1 - alpha) * fp_start + alpha * fp_end
                 
                 # Sample with the mixed embedding
-                gen = model.sample(1, control_img, fp_interp.unsqueeze(0), num_steps=50)
+                gen = model.sample(1, control_img, fp_interp.unsqueeze(0), num_steps=50, guidance_scale=self.config.guidance_scale)
                 
                 # Post-process for display ([-1, 1] -> [0, 1])
                 img = gen.squeeze().cpu().permute(1, 2, 0).numpy()
@@ -4232,6 +4270,12 @@ def main():
     parser.add_argument("--use-transformer", action="store_true",
                        help="Use U-ViT Transformer backbone instead of U-Net (better for global coordination)")
     
+    # CFG Settings
+    parser.add_argument("--cfg-dropout-prob", type=float, default=0.1,
+                       help="CFG dropout probability during training (0.1 = 10%% chance to drop condition)")
+    parser.add_argument("--guidance-scale", type=float, default=4.0,
+                       help="CFG guidance scale for inference (2.0-7.0, higher = stronger drug effect)")
+    
     # Biological constraints
     parser.add_argument("--enable-bio-loss", action="store_true",
                        help="Enable DNA preservation loss in PPO phase (CellFlux methodology)")
@@ -4269,6 +4313,8 @@ def main():
         seed=args.seed,
         reuse_pretrained=not args.no_reuse_pretrained,
         use_transformer=args.use_transformer,
+        cfg_dropout_prob=args.cfg_dropout_prob,
+        guidance_scale=args.guidance_scale,
         enable_bio_loss=args.enable_bio_loss,
     )
     
