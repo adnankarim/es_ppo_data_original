@@ -117,44 +117,50 @@ class BioPerceptualLoss(nn.Module):
     """
     def __init__(self, device):
         super().__init__()
-        self.device = device
+        self.device = torch.device(device)
         if TRANSFORMERS_AVAILABLE:
-            print("Loading DINOv2-Small for Bio-Perceptual Loss...")
+            print(f"Loading DINOv2-Small for Bio-Perceptual Loss on {self.device}...")
             # dinov2-small is fast and sufficient for biological texture
-            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(device)
+            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(self.device)
             self.model.eval()
             for p in self.model.parameters():
                 p.requires_grad = False
             
             # DINOv2 ImageNet Normalization
-            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
-            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device))
+            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device))
         else:
             self.model = None
 
     def forward(self, pred_x0, target_x0):
         """
         Args:
-            pred_x0: Generated images (B, 3, H, W) in range [-1, 1]
-            target_x0: Real images (B, 3, H, W) in range [-1, 1]
+            pred_x0: Generated images (B, 3, H, W) in range [-1, 1] on main device
+            target_x0: Real images (B, 3, H, W) in range [-1, 1] on main device
+        Returns:
+            Loss tensor on the same device as pred_x0 (for backprop)
         """
         if self.model is None: 
-            return torch.tensor(0.0).to(self.device)
+            return torch.tensor(0.0, device=pred_x0.device, dtype=pred_x0.dtype)
 
-        # 1. Denormalize [-1, 1] -> [0, 1]
-        pred = (pred_x0 + 1.0) * 0.5
-        target = (target_x0 + 1.0) * 0.5
+        # 1. Move inputs to Aux Device (e.g., CPU or 2nd GPU)
+        pred = pred_x0.to(self.device)
+        target = target_x0.to(self.device)
 
-        # 2. Resize to 224x224 (Native DINO resolution)
+        # 2. Denormalize [-1, 1] -> [0, 1]
+        pred = (pred + 1.0) * 0.5
+        target = (target + 1.0) * 0.5
+
+        # 3. Resize to 224x224 (Native DINO resolution)
         # Bilinear interpolation is differentiable
         pred = F.interpolate(pred, size=(224, 224), mode='bilinear', align_corners=False)
         target = F.interpolate(target, size=(224, 224), mode='bilinear', align_corners=False)
 
-        # 3. Normalize for DINO
+        # 4. Normalize for DINO
         pred = (pred - self.mean) / self.std
         target = (target - self.mean) / self.std
 
-        # 4. Extract Features
+        # 5. Extract Features
         # We allow gradients to flow back from pred features to the generator
         pred_out = self.model(pred, output_hidden_states=True)
         with torch.no_grad():
@@ -164,8 +170,11 @@ class BioPerceptualLoss(nn.Module):
         pred_feat = pred_out.last_hidden_state.mean(dim=1) # (B, 384)
         target_feat = target_out.last_hidden_state.mean(dim=1)
 
-        # 5. Semantic MSE
-        return F.mse_loss(pred_feat, target_feat)
+        # 6. Semantic MSE
+        loss = F.mse_loss(pred_feat, target_feat)
+        
+        # 7. Return loss to Main Device (so backprop works on the main model)
+        return loss.to(pred_x0.device)
 
 class MoLFormerEncoder:
     """
@@ -302,6 +311,8 @@ class BBBC021Config:
     use_wandb: bool = True
     wandb_project: str = "bbbc021-ddmec-ablation"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # NEW: Flag for auxiliary models (Metrics, DINO, Encoders)
+    aux_device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
     
     # Model management
@@ -339,44 +350,50 @@ class BioPerceptualLoss(nn.Module):
     """
     def __init__(self, device):
         super().__init__()
-        self.device = device
+        self.device = torch.device(device)
         if TRANSFORMERS_AVAILABLE:
-            print("Loading DINOv2-Small for Bio-Perceptual Loss...")
+            print(f"Loading DINOv2-Small for Bio-Perceptual Loss on {self.device}...")
             # dinov2-small is fast and sufficient for biological texture
-            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(device)
+            self.model = AutoModel.from_pretrained('facebook/dinov2-small').to(self.device)
             self.model.eval()
             for p in self.model.parameters():
                 p.requires_grad = False
             
             # DINOv2 ImageNet Normalization
-            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
-            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
+            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device))
+            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device))
         else:
             self.model = None
 
     def forward(self, pred_x0, target_x0):
         """
         Args:
-            pred_x0: Generated images (B, 3, H, W) in range [-1, 1]
-            target_x0: Real images (B, 3, H, W) in range [-1, 1]
+            pred_x0: Generated images (B, 3, H, W) in range [-1, 1] on main device
+            target_x0: Real images (B, 3, H, W) in range [-1, 1] on main device
+        Returns:
+            Loss tensor on the same device as pred_x0 (for backprop)
         """
         if self.model is None: 
-            return torch.tensor(0.0).to(self.device)
+            return torch.tensor(0.0, device=pred_x0.device, dtype=pred_x0.dtype)
 
-        # 1. Denormalize [-1, 1] -> [0, 1]
-        pred = (pred_x0 + 1.0) * 0.5
-        target = (target_x0 + 1.0) * 0.5
+        # 1. Move inputs to Aux Device (e.g., CPU or 2nd GPU)
+        pred = pred_x0.to(self.device)
+        target = target_x0.to(self.device)
 
-        # 2. Resize to 224x224 (Native DINO resolution)
+        # 2. Denormalize [-1, 1] -> [0, 1]
+        pred = (pred + 1.0) * 0.5
+        target = (target + 1.0) * 0.5
+
+        # 3. Resize to 224x224 (Native DINO resolution)
         # Bilinear interpolation is differentiable
         pred = F.interpolate(pred, size=(224, 224), mode='bilinear', align_corners=False)
         target = F.interpolate(target, size=(224, 224), mode='bilinear', align_corners=False)
 
-        # 3. Normalize for DINO
+        # 4. Normalize for DINO
         pred = (pred - self.mean) / self.std
         target = (target - self.mean) / self.std
 
-        # 4. Extract Features
+        # 5. Extract Features
         # We allow gradients to flow back from pred features to the generator
         pred_out = self.model(pred, output_hidden_states=True)
         with torch.no_grad():
@@ -386,8 +403,11 @@ class BioPerceptualLoss(nn.Module):
         pred_feat = pred_out.last_hidden_state.mean(dim=1) # (B, 384)
         target_feat = target_out.last_hidden_state.mean(dim=1)
 
-        # 5. Semantic MSE
-        return F.mse_loss(pred_feat, target_feat)
+        # 6. Semantic MSE
+        loss = F.mse_loss(pred_feat, target_feat)
+        
+        # 7. Return loss to Main Device (so backprop works on the main model)
+        return loss.to(pred_x0.device)
 
 class MoLFormerEncoder:
     """
@@ -2256,6 +2276,7 @@ class ImageESTrainer:
         lr: float = 0.0005,
         device: str = "cuda",
         use_bio_loss: bool = False,  # [NEW] Flag for DNA preservation
+        aux_device: str = "cuda",  # NEW: Device for auxiliary models
     ):
         self.ddpm = ddpm
         self.population_size = population_size
@@ -2263,8 +2284,8 @@ class ImageESTrainer:
         self.lr = lr
         self.device = torch.device(device)
         self.use_bio_loss = use_bio_loss
-        # [NEW] Initialize Bio-Perceptual Loss
-        self.bio_perceptual_loss = BioPerceptualLoss(device)
+        # [NEW] Initialize Bio-Perceptual Loss on Aux Device
+        self.bio_perceptual_loss = BioPerceptualLoss(aux_device)
     
     def compute_fitness(
         self,
@@ -2414,6 +2435,7 @@ class ImagePPOTrainer:
         lr: float = 5e-5,
         device: str = "cuda",
         use_bio_loss: bool = False,
+        aux_device: str = "cuda",  # NEW: Device for auxiliary models
     ):
         self.cond_model = cond_model
         self.pretrain_model = pretrain_model
@@ -2422,8 +2444,8 @@ class ImagePPOTrainer:
         self.device = torch.device(device)
         self.use_bio_loss = use_bio_loss  # Store the flag
         
-        # [NEW] Initialize Bio-Perceptual Loss
-        self.bio_perceptual_loss = BioPerceptualLoss(device)
+        # [NEW] Initialize Bio-Perceptual Loss on Aux Device
+        self.bio_perceptual_loss = BioPerceptualLoss(aux_device)
         
         # Freeze pretrained model
         self.pretrain_model.model.eval()
@@ -2524,7 +2546,7 @@ class ImageMetrics:
     """
     
     def __init__(self, device='cuda'):
-        self.device = device
+        self.device = torch.device(device)
         self.inception = None
         self.fid_metric = None
         if TORCHMETRICS_AVAILABLE:
@@ -2532,7 +2554,7 @@ class ImageMetrics:
             from torchmetrics.image.fid import FrechetInceptionDistance
             # normalize=True handles float inputs for the main .update() calls,
             # but the internal .inception network often expects uint8.
-            self.fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+            self.fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(self.device)
             self.inception = self.fid_metric.inception
             self.inception.eval()
 
@@ -2542,7 +2564,7 @@ class ImageMetrics:
         if self.inception is None:
             return None
         
-        # 1. Convert to Float Tensor on Device
+        # 1. Move numpy -> tensor on Aux Device
         images_t = torch.tensor(images).float().to(self.device)
         
         # 2. Normalize to [0, 1] Range
@@ -2565,9 +2587,10 @@ class ImageMetrics:
             # The internal torch-fidelity module explicitly checks for uint8
             batch_uint8 = (batch * 255).to(torch.uint8)
             
-            # 5. Extract Features
+            # 5. Extract Features (on Aux Device)
             feats = self.inception(batch_uint8)
-            features.append(feats.cpu())
+            # Keep features on Aux Device (or CPU if specified) for consistency
+            features.append(feats)
             
         return torch.cat(features)
 
@@ -2576,9 +2599,14 @@ class ImageMetrics:
         """Calculate FID using pre-computed features (Fast)."""
         if real_features is None or fake_features is None:
             return 0.0
+        
+        # Ensure features are on Aux Device for calculation
+        real_features = real_features.to(self.device)
+        fake_features = fake_features.to(self.device)
+        
         # Manual FID calculation using Gaussian statistics
-        mu1, sigma1 = self._compute_stats(real_features.numpy())
-        mu2, sigma2 = self._compute_stats(fake_features.numpy())
+        mu1, sigma1 = self._compute_stats(real_features.cpu().numpy())
+        mu2, sigma2 = self._compute_stats(fake_features.cpu().numpy())
         return self._calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
 
     @staticmethod
@@ -2858,8 +2886,8 @@ class BBBC021AblationRunner:
             self.chem_encoder = MorganFingerprintEncoder(n_bits=config.morgan_bits)
             self.fingerprint_dim = config.morgan_bits
         else:
-            print("Using MoLFormer Embeddings (768-dim)")
-            self.chem_encoder = MoLFormerEncoder(device=config.device)
+            print(f"Using MoLFormer Embeddings (768-dim) on {config.aux_device}...")
+            self.chem_encoder = MoLFormerEncoder(device=config.aux_device)
             self.fingerprint_dim = 768
         
         # Load dataset with batch-aware splits
@@ -3525,6 +3553,7 @@ class BBBC021AblationRunner:
             lr=lr,
             device=self.config.device,
             use_bio_loss=self.config.enable_bio_loss,  # [ADDED] Pass the flag
+            aux_device=self.config.aux_device,
         )
         
         print(f"  [Incremental] Starting ES Training: {es_start_epoch} -> {es_target_epoch}")
@@ -3625,6 +3654,7 @@ class BBBC021AblationRunner:
             lr=lr,
             device=self.config.device,
             use_bio_loss=self.config.enable_bio_loss,
+            aux_device=self.config.aux_device,
         )
         
         # Load state
@@ -3727,7 +3757,7 @@ class BBBC021AblationRunner:
         """
         print("\n=== Running NSCB Benchmark (Batch Generalization) ===")
         cond_ddpm.model.eval()
-        metrics_engine = ImageMetrics(device=self.config.device)
+        metrics_engine = ImageMetrics(device=self.config.aux_device)
         
         # Load Test Data
         test_dataset = BBBC021Dataset(
@@ -3807,7 +3837,7 @@ class BBBC021AblationRunner:
         3. Deep MoA Accuracy (Using Inception Features) -> Target > 70%
         """
         cond_ddpm.model.eval()
-        metrics_engine = ImageMetrics(device=self.config.device)
+        metrics_engine = ImageMetrics(device=self.config.aux_device)
         
         # 1. Generate Data
         all_real = []
@@ -3999,8 +4029,8 @@ class BBBC021AblationRunner:
         if actual_samples != num_samples:
             print(f"WARNING: Expected {num_samples} samples but got {actual_samples}")
         
-        # 3. Calculate FID using the new device-aware method
-        fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.device)
+        # 3. Calculate FID using the new device-aware method (on aux device)
+        fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.aux_device)
         
         # Calculate fast metrics
         mse = ImageMetrics.compute_mse(real_images, fake_images)
@@ -4988,6 +5018,10 @@ def main():
     parser.add_argument("--enable-bio-loss", action="store_true",
                        help="Enable DNA preservation loss in PPO phase (CellFlux methodology)")
     
+    # Device Settings
+    parser.add_argument("--aux-device", type=str, default="cuda",
+                       help="Device for aux models (Metrics, DINO, Encoders). Use 'cpu' to save VRAM.")
+    
     args = parser.parse_args()
     
     config = BBBC021Config(
@@ -5027,6 +5061,7 @@ def main():
         cfg_dropout_prob=args.cfg_dropout_prob,
         guidance_scale=args.guidance_scale,
         enable_bio_loss=args.enable_bio_loss,
+        aux_device=args.aux_device,
     )
     
     runner = BBBC021AblationRunner(config)
