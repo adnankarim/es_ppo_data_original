@@ -255,9 +255,10 @@ class BBBC021Config:
     cfg_dropout_prob: float = 0.1  # 10% chance to drop condition during training
     guidance_scale: float = 4.0    # Inference strength (try 2.0 - 7.0)
     
-    # Perturbation encoding
+    # Fingerprint Configuration
+    use_morgan_fingerprints: bool = True  # Default to CellFlux standard (Morgan)
     morgan_bits: int = 1024  # Morgan fingerprint dimensions
-    perturbation_embed_dim: int = 768  # Updated for MoLFormer (ChemBERTa uses 768)
+    perturbation_embed_dim: int = 256  # Embedding dimension (256 for Morgan, 768 for MoLFormer)
     
     # DDPM pretraining
     ddpm_epochs: int = 500  # Increased from 100 - DDPMs need more epochs to converge (FID < 200)
@@ -609,13 +610,14 @@ class BBBC021Dataset(Dataset):
         image_size: int = 96,
         split: str = "train",  # "train", "val", "test"
         transform: Optional[transforms.Compose] = None,
-        morgan_encoder: Optional[MorganFingerprintEncoder] = None,  # For backward compatibility, but will use MoLFormer
+        morgan_encoder: Optional[Any] = None,  # chem_encoder instance (Morgan or MoLFormer)
+        exclude_ood: bool = False,  # Explicit control for OOD filtering
     ):
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.split = split
-        # CHANGED: Use MoLFormer if available, passed as 'morgan_encoder' argument for compatibility
         self.chem_encoder = morgan_encoder or MoLFormerEncoder(device='cpu')
+        self.exclude_ood = exclude_ood
         
         # Default transforms
         if transform is None:
@@ -649,7 +651,8 @@ class BBBC021Dataset(Dataset):
     
     def _load_metadata(self, metadata_file: str) -> List[Dict]:
         """
-        Load metadata with Robust Substring Splitting for Windows/IMPA.
+        Load metadata based on SPLIT column only (removed batch naming heuristics).
+        OOD filtering is controlled explicitly by exclude_ood parameter.
         """
         metadata_path = self.data_dir / metadata_file
         
@@ -680,33 +683,16 @@ class BBBC021Dataset(Dataset):
                 batch_name = str(row.get('batch', row.get('BATCH', row.get('Plate', row.get('PLATE', '0'))))).strip()
                 found_batches.add(batch_name)
 
-                # 2. Determine Split (Robust Substring Logic)
-                row_split = row.get('split') or row.get('SPLIT') or ''
+                # 2. Determine Split (Strict adherence to CSV SPLIT column)
+                row_split = (row.get('split') or row.get('SPLIT') or '').lower()
                 
-                if not row_split:
-                    # Check for keywords in the batch name (case insensitive)
-                    b_upper = batch_name.upper()
-                    
-                    # Test Set: Week 10 or Batch 09
-                    if 'WEEK10' in b_upper or 'WEEK 10' in b_upper or 'BATCH_09' in b_upper:
-                        row_split = 'test'
-                    # Validation Set: Week 8, 9 or Batch 07, 08
-                    elif any(x in b_upper for x in ['WEEK8', 'WEEK 8', 'WEEK9', 'WEEK 9', 'BATCH_07', 'BATCH_08']):
-                        row_split = 'val'
-                    # Training Set: Everything else
-                    else:
-                        row_split = 'train'
-                else:
-                    # Normalize split value to lowercase
-                    row_split = row_split.lower()
-
-                # 3. Filtering
+                # Filter by SPLIT (Strict adherence to CSV)
                 if row_split != self.split:
                     continue
 
-                # Filter by OOD (Training only)
+                # 3. Filter by OOD (Explicit check, controlled by exclude_ood parameter)
                 is_ood = compound in ood_compounds
-                if self.split == 'train' and is_ood:
+                if self.exclude_ood and is_ood:
                     continue
 
                 # 4. Path Construction
@@ -761,8 +747,9 @@ class BBBC021Dataset(Dataset):
                     compound = row.get('compound') or row.get('CPD_NAME') or 'DMSO'
                     filename = row.get('image_path') or row.get('SAMPLE_KEY') or ''
                     
-                    # Skip OOD for safety
-                    if compound in ood_compounds: 
+                    # Filter by OOD (Explicit check, controlled by exclude_ood parameter)
+                    is_ood = compound in ood_compounds
+                    if self.exclude_ood and is_ood:
                         continue
                     
                     # Quick path fix
@@ -2865,6 +2852,16 @@ class BBBC021AblationRunner:
         # Global model directory
         os.makedirs(config.global_model_dir, exist_ok=True)
         
+        # --- Fingerprint & Encoder Setup ---
+        if config.use_morgan_fingerprints:
+            print(f"Using Morgan Fingerprints ({config.morgan_bits}-bit)")
+            self.chem_encoder = MorganFingerprintEncoder(n_bits=config.morgan_bits)
+            self.fingerprint_dim = config.morgan_bits
+        else:
+            print("Using MoLFormer Embeddings (768-dim)")
+            self.chem_encoder = MoLFormerEncoder(device=config.device)
+            self.fingerprint_dim = 768
+        
         # Load dataset with batch-aware splits
         print("Loading BBBC021 dataset with batch-aware splits...")
         
@@ -2894,14 +2891,11 @@ class BBBC021AblationRunner:
             # Use CellFlux-compliant loading
             print("\n=== Using CellFlux-Compliant Split Logic ===")
             
-            # Initialize chemical encoder
-            chem_encoder = MoLFormerEncoder(device='cpu')
-            
-            # Load using CellFlux-compliant function
+            # Load using CellFlux-compliant function (use configured encoder)
             train_dataset_cf, test_dataset_cf, split_info = load_cellflux_splits(
                 metadata_path,
                 config.data_dir,
-                chem_encoder=chem_encoder,
+                chem_encoder=self.chem_encoder,
                 exclude_ood_from_train=False  # OOD compounds NOT excluded from training
             )
             
@@ -2949,15 +2943,21 @@ class BBBC021AblationRunner:
             # 5. Load datasets with split-specific CSVs
             self.train_dataset = BBBC021Dataset(
                 config.data_dir, train_csv,
-                config.image_size, split="train"
+                config.image_size, split="train",
+                morgan_encoder=self.chem_encoder,
+                exclude_ood=False  # Explicitly keep all compounds
             )
             self.val_dataset = BBBC021Dataset(
                 config.data_dir, val_csv,
-                config.image_size, split="val"
+                config.image_size, split="val",
+                morgan_encoder=self.chem_encoder,
+                exclude_ood=False
             )
             self.test_dataset = BBBC021Dataset(
                 config.data_dir, test_csv,
-                config.image_size, split="test"
+                config.image_size, split="test",
+                morgan_encoder=self.chem_encoder,
+                exclude_ood=False
             )
         
         # Initialize wandb
@@ -3261,7 +3261,7 @@ class BBBC021AblationRunner:
             device=self.config.device,
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
-            fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
+            fingerprint_input_dim=self.fingerprint_dim,  # Dynamic dimension (1024 for Morgan, 768 for MoLFormer)
             use_transformer=self.config.use_transformer,
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
@@ -3321,7 +3321,8 @@ class BBBC021AblationRunner:
 
             # 2. Evaluate (Every 150 epochs)
             if (epoch + 1) % 150 == 0:
-                metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
+                # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
+                metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
                 kl_score = metrics.get('kl_div_total', 0.0)
                 mi_score = metrics.get('mutual_information', 0.0)
@@ -3360,7 +3361,8 @@ class BBBC021AblationRunner:
         if self.config.follow_cellflux and (target_epoch - 1) % 150 != 0:
             # If we didn't evaluate at the final epoch, do it now
             print(f"\n  [CellFlux Mode] Running final evaluation at epoch {target_epoch}...")
-            metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
+            # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
+            metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
             fid_score = metrics.get('fid', 0.0)
             kl_score = metrics.get('kl_div_total', 0.0)
             avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
@@ -3395,7 +3397,7 @@ class BBBC021AblationRunner:
             device=self.config.device,
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
-            fingerprint_input_dim=768,  # MoLFormer uses 768-dim embeddings
+            fingerprint_input_dim=self.fingerprint_dim,  # Dynamic dimension (1024 for Morgan, 768 for MoLFormer)
             use_transformer=self.config.use_transformer,
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
@@ -4907,6 +4909,14 @@ def main():
     parser.add_argument("--follow-cellflux", "--follow_cellflux", action="store_true",
                        help="Match CellFlux split: use CSV SPLIT train/test; set validation=test (no held-out val)")
     
+    # Fingerprint Configuration
+    parser.add_argument("--use-morgan-fingerprints", "--use_morgan_fingerprints", action="store_true", default=True,
+                       help="Use Morgan fingerprints (CellFlux standard, 1024-bit). Default: True")
+    parser.add_argument("--use-molformer", action="store_true",
+                       help="Use MoLFormer embeddings (768-dim) instead of Morgan fingerprints")
+    parser.add_argument("--morgan-bits", type=int, default=1024,
+                       help="Morgan fingerprint bit size (default: 1024)")
+    
     # Training
     parser.add_argument("--ddpm-epochs", type=int, default=500,
                        help="DDPM pretraining epochs (recommended: 500-1000 for convergence)")
@@ -4990,6 +5000,8 @@ def main():
         data_dir=args.data_dir,
         metadata_file=args.metadata_file,
         follow_cellflux=args.follow_cellflux,
+        use_morgan_fingerprints=args.use_morgan_fingerprints and not args.use_molformer,
+        morgan_bits=args.morgan_bits,
         ddpm_epochs=args.ddpm_epochs,
         coupling_epochs=args.coupling_epochs,
         warmup_epochs=args.warmup_epochs,
