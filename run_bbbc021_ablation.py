@@ -466,6 +466,8 @@ class MorganFingerprintEncoder:
     This gives each perturbation a unique mathematical "ID" - Taxol looks different
     from Nocodazole in this vector space, allowing the model to distinguish between
     different drugs and learn drug-specific morphological transformations.
+    
+    Updated to handle both single SMILES and batches (lists).
     """
     
     def __init__(self, n_bits: int = 1024, radius: int = 2):
@@ -473,12 +475,18 @@ class MorganFingerprintEncoder:
         self.radius = radius
         self.cache = {}
         
-    def encode(self, smiles: str) -> np.ndarray:
-        """Encode SMILES string to Morgan fingerprint."""
+    def encode(self, smiles: Any) -> np.ndarray:
+        """Encode SMILES string(s) to Morgan fingerprint."""
+        # NEW: Handle batch input (list of strings)
+        if isinstance(smiles, list):
+            # Just iterate and return as a numpy array
+            return np.array([self.encode(s) for s in smiles])
+
+        # Existing single-string logic
         if smiles in self.cache:
             return self.cache[smiles]
         
-        if RDKIT_AVAILABLE and smiles and smiles != 'DMSO':
+        if RDKIT_AVAILABLE and smiles and smiles != 'DMSO' and smiles != 'CS(=O)C':
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is not None:
@@ -491,12 +499,14 @@ class MorganFingerprintEncoder:
             except Exception as e:
                 print(f"Warning: Failed to encode SMILES '{smiles}': {e}")
         
-        # Fallback: use hash-based encoding
-        np.random.seed(hash(smiles) % (2**32))
-        arr = np.random.rand(self.n_bits).astype(np.float32)
-        arr = (arr > 0.5).astype(np.float32)
-        self.cache[smiles] = arr
-        return arr
+        # Fallback: use hash-based encoding for single string
+        if smiles not in self.cache:
+            np.random.seed(hash(str(smiles)) % (2**32))
+            arr = np.random.rand(self.n_bits).astype(np.float32)
+            arr = (arr > 0.5).astype(np.float32)
+            self.cache[smiles] = arr
+            
+        return self.cache[smiles]
 
 
 # ============================================================================
@@ -3348,7 +3358,7 @@ class BBBC021AblationRunner:
             gpu_stats = self._get_gpu_stats()
 
             # 2. Evaluate (Every 150 epochs)
-            if (epoch + 1) % 150 == 0:
+            if (epoch + 1) % 50 == 0:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
