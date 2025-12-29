@@ -39,6 +39,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -237,6 +238,7 @@ class BBBC021Config:
     # For IMPA dataset on Windows, use: r"C:\Users\dell\Downloads\IMPA_reproducibility\IMPA_reproducibility\datasets\bbbc021_all\bbbc021_all"
     data_dir: str = "./data/bbbc021_all"  # Directory containing BBBC021 data (supports nested .npy files)
     metadata_file: str = "metadata/bbbc021_df_all.csv"  # Metadata CSV file (or "metadata/bbbc021_df_all.csv" for IMPA)
+    follow_cellflux: bool = False  # If True: use SPLIT train/test as-is; set VAL = TEST (CellFlux-style)
     
     # Global Model Management
     global_model_dir: str = "./global_pretrained_models"
@@ -308,7 +310,7 @@ class BBBC021Config:
     enable_bio_loss: bool = False  # Enable DNA preservation loss in PPO
     
     # Evaluation
-    num_eval_samples: int = 5000
+    num_eval_samples: int = 1000
     fid_batch_size: int = 64
     
     # Memory optimization
@@ -474,6 +476,118 @@ class MorganFingerprintEncoder:
         arr = (arr > 0.5).astype(np.float32)
         self.cache[smiles] = arr
         return arr
+
+
+# ============================================================================
+# CELLFLUX OOD COMPOUND LIST (for separate OOD benchmark, NOT for filtering)
+# ============================================================================
+
+CELLFLUX_OOD_COMPOUNDS = {
+    'AZ841', 'cyclohexamide', 'cytochalasin D', 'docetaxel', 
+    'epothilone B', 'lactacystin', 'latrunculin B', 'simvastatin'
+}
+
+# ============================================================================
+# BATCH-AWARE SPLIT HELPER
+# ============================================================================
+
+def make_batch_aware_splits(df: pd.DataFrame, seed: int = 0):
+    """
+    Creates batch-aware train/val/test splits from metadata CSV.
+    
+    Uses CSV SPLIT column for test, and creates a batch-held-out val from train.
+    Works per-compound to ensure every compound has proper validation data.
+    
+    Returns: train_df, val_df, test_df, info_dict
+    """
+    # 1) TEST = as provided in CSV
+    test_df = df[df["SPLIT"].str.lower() == "test"].copy() if "SPLIT" in df.columns else pd.DataFrame()
+    
+    # 2) Candidate TRAIN pool (as provided in CSV)
+    train_pool = df[df["SPLIT"].str.lower() == "train"].copy() if "SPLIT" in df.columns else df.copy()
+    
+    if len(train_pool) == 0:
+        raise ValueError("No training data found in CSV. Check SPLIT column.")
+    
+    # 3) Get all compounds (excluding DMSO as a "compound" for split purposes)
+    # We'll handle DMSO controls separately
+    compounds = train_pool[train_pool["CPD_NAME"] != "DMSO"]["CPD_NAME"].unique()
+    
+    train_dfs = []
+    val_dfs = []
+    
+    rng = np.random.RandomState(seed)
+    
+    # 4) Process each compound separately
+    for compound in compounds:
+        # Treated rows for this compound (TRAIN pool only)
+        trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound)].copy()
+        
+        if trt.empty:
+            continue  # Skip compounds with no treated data
+        
+        batches = sorted(trt["BATCH"].unique())
+        
+        if len(batches) < 2:
+            # If only one batch, put it all in train (no val for this compound)
+            train_dfs.append(trt)
+            # Still need controls for this batch
+            ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(batches))].copy()
+            train_dfs.append(ctrl)
+            continue
+        
+        # Choose 1 val batch deterministically (seeded random)
+        val_batch = rng.choice(batches, size=1, replace=False)[0]
+        val_batches = {val_batch}
+        train_batches = set(batches) - val_batches
+        
+        # Build TRAIN treated + controls (only those batches)
+        trn_trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound) &
+                             (train_pool["BATCH"].isin(train_batches))].copy()
+        val_trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound) &
+                             (train_pool["BATCH"].isin(val_batches))].copy()
+        
+        # Controls: DMSO rows from matching batches
+        trn_ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(train_batches))].copy()
+        val_ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(val_batches))].copy()
+        
+        train_dfs.extend([trn_trt, trn_ctrl])
+        val_dfs.extend([val_trt, val_ctrl])
+    
+    # Combine all compounds
+    train_df = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
+    val_df = pd.concat(val_dfs, ignore_index=True) if val_dfs else pd.DataFrame()
+    
+    # Ensure test_df has the right structure
+    if len(test_df) == 0:
+        test_df = df[df["SPLIT"].str.lower() == "test"].copy() if "SPLIT" in df.columns else pd.DataFrame()
+    
+    # Add SPLIT column to each DataFrame so dataset recognizes them
+    if len(train_df) > 0:
+        train_df["SPLIT"] = "train"
+    if len(val_df) > 0:
+        val_df["SPLIT"] = "val"
+    if len(test_df) > 0:
+        test_df["SPLIT"] = "test"
+    
+    info = {
+        "train_batches": sorted(train_df["BATCH"].unique()) if len(train_df) > 0 else [],
+        "val_batches": sorted(val_df["BATCH"].unique()) if len(val_df) > 0 else [],
+        "test_batches": sorted(test_df["BATCH"].unique()) if len(test_df) > 0 else [],
+    }
+    
+    return train_df, val_df, test_df, info
+
+
+def split_summary(name: str, d: pd.DataFrame):
+    """Print summary statistics for a split."""
+    if len(d) == 0:
+        print(f"{name}: EMPTY")
+        return
+    trt = (d["STATE"] == 1).sum() if "STATE" in d.columns else 0
+    ctrl = (d["STATE"] == 0).sum() if "STATE" in d.columns else 0
+    nb = d["BATCH"].nunique() if "BATCH" in d.columns else 0
+    print(f"{name}: rows={len(d)} treated={trt} control={ctrl} batches={nb}")
 
 
 # ============================================================================
@@ -1317,6 +1431,372 @@ class PerturbationEncoder(nn.Module):
     
     def forward(self, fingerprint: torch.Tensor) -> torch.Tensor:
         return self.net(fingerprint)
+
+
+# ============================================================================
+# CELLFLUX-COMPLIANT DATASET AND DATALOADER
+# ============================================================================
+
+class BBBC021DatasetCellFlux(Dataset):
+    """
+    BBBC021 Dataset with CellFlux-compliant split logic.
+    
+    KEY CHANGES FROM ORIGINAL:
+    1. Uses SPLIT column directly (no custom batch-holdout)
+    2. Does NOT filter OOD compounds during training
+    3. Proper same-batch control-treated pairing
+    """
+    
+    def __init__(
+        self,
+        data_dir: str,
+        metadata_df: pd.DataFrame,  # Accept DataFrame directly
+        image_size: int = 96,
+        split: str = "train",
+        transform=None,
+        chem_encoder=None,
+        exclude_ood: bool = False,  # Only True for OOD benchmark
+    ):
+        self.data_dir = Path(data_dir)
+        self.image_size = image_size
+        self.split = split
+        self.chem_encoder = chem_encoder
+        
+        # Default transforms
+        if transform is None:
+            from torchvision import transforms
+            self.transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        else:
+            self.transform = transform
+        
+        # Load metadata using CellFlux logic
+        self.metadata = self._load_metadata_cellflux(metadata_df, exclude_ood)
+        
+        # Build batch-to-indices mapping (CRITICAL for same-batch pairing)
+        self._build_batch_indices()
+        
+        # Get unique compounds and MoA classes
+        self.compounds = sorted(list(set(m['compound'] for m in self.metadata)))
+        self.moa_classes = sorted(list(set(m['moa'] for m in self.metadata if m['moa'])))
+        self.compound_to_idx = {c: i for i, c in enumerate(self.compounds)}
+        self.moa_to_idx = {m: i for i, m in enumerate(self.moa_classes)}
+        
+        # Precompute embeddings
+        if self.chem_encoder:
+            self._precompute_embeddings()
+        
+        print(f"BBBC021 [{split}]: {len(self.metadata)} samples, "
+              f"{len(self.compounds)} compounds, {len(self.moa_classes)} MoA classes")
+    
+    def _load_metadata_cellflux(self, df: pd.DataFrame, exclude_ood: bool) -> List[Dict]:
+        """CellFlux-compliant metadata loading."""
+        metadata = []
+        
+        # Filter by split
+        split_col = 'SPLIT' if 'SPLIT' in df.columns else 'split'
+        if split_col not in df.columns:
+            raise ValueError(f"CSV must have '{split_col}' column with 'train'/'test' values")
+        
+        df_split = df[df[split_col].str.lower() == self.split.lower()].copy()
+        
+        if len(df_split) == 0:
+            print(f"WARNING: No samples found for split='{self.split}'")
+            return []
+        
+        # Optionally exclude OOD (ONLY for OOD benchmark, NOT for main training)
+        if exclude_ood:
+            before_count = len(df_split)
+            df_split = df_split[~df_split['CPD_NAME'].isin(CELLFLUX_OOD_COMPOUNDS)]
+            print(f"  Excluded {before_count - len(df_split)} OOD samples")
+        
+        for _, row in df_split.iterrows():
+            compound = row.get('CPD_NAME', row.get('compound', 'DMSO'))
+            moa = row.get('ANNOT', row.get('moa', row.get('MOA', '')))
+            batch = str(row.get('BATCH', row.get('batch', '0'))).strip()
+            smiles = row.get('SMILES', row.get('smiles', ''))
+            dose = float(row.get('DOSE', row.get('concentration', 0)))
+            
+            # STATE column: 1 = treated, 0 = control (DMSO)
+            if 'STATE' in row:
+                is_control = (row['STATE'] == 0)
+            else:
+                is_control = (compound.upper() == 'DMSO')
+            
+            # Build image path
+            sample_key = row.get('SAMPLE_KEY', row.get('image_path', ''))
+            if sample_key and not sample_key.endswith('.npy'):
+                sample_key = sample_key + '.npy'
+            
+            metadata.append({
+                'image_path': sample_key,
+                'compound': compound,
+                'concentration': dose,
+                'moa': moa,
+                'batch': batch,
+                'is_control': is_control,
+                'smiles': smiles,
+            })
+        
+        return metadata
+    
+    def _build_batch_indices(self):
+        """Build indices for same-batch pairing."""
+        from collections import defaultdict
+        self.batch_to_indices = defaultdict(list)
+        for idx, meta in enumerate(self.metadata):
+            self.batch_to_indices[meta['batch']].append(idx)
+        
+        self.batch_to_ctrl_indices = defaultdict(list)
+        self.batch_to_trt_indices = defaultdict(list)
+        
+        for idx, meta in enumerate(self.metadata):
+            batch = meta['batch']
+            if meta['is_control']:
+                self.batch_to_ctrl_indices[batch].append(idx)
+            else:
+                self.batch_to_trt_indices[batch].append(idx)
+    
+    def _precompute_embeddings(self):
+        """Precompute chemical embeddings."""
+        unique_smiles = {m.get('smiles', '') for m in self.metadata if m.get('smiles')}
+        unique_smiles.discard('')
+        
+        if unique_smiles and hasattr(self.chem_encoder, 'encode'):
+            print(f"  Pre-encoding {len(unique_smiles)} unique compounds...")
+            batch_size = 32
+            smiles_list = list(unique_smiles)
+            for i in range(0, len(smiles_list), batch_size):
+                batch = smiles_list[i:i+batch_size]
+                self.chem_encoder.encode(batch)
+        
+        self.fingerprints = {}
+        for meta in self.metadata:
+            compound = meta['compound']
+            if compound not in self.fingerprints:
+                smiles = meta.get('smiles', '')
+                if not smiles:
+                    smiles = 'DMSO'
+                if hasattr(self.chem_encoder, 'encode'):
+                    emb = self.chem_encoder.encode([smiles]).squeeze(0).cpu().numpy()
+                else:
+                    emb = self.chem_encoder.encode(smiles)
+                self.fingerprints[compound] = emb
+    
+    def __len__(self) -> int:
+        return len(self.metadata)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        meta = self.metadata[idx]
+        
+        # Load image
+        image = self._load_image(meta['image_path'])
+        
+        # Get perturbation embedding
+        smiles = meta.get('smiles', '')
+        if not smiles:
+            smiles = 'DMSO'
+        
+        if hasattr(self.chem_encoder, 'encode'):
+            fingerprint = self.chem_encoder.encode([smiles]).squeeze(0)
+        else:
+            fingerprint = torch.tensor(self.chem_encoder.encode(smiles), dtype=torch.float32)
+        
+        moa_idx = self.moa_to_idx.get(meta['moa'], 0)
+        compound_idx = self.compound_to_idx.get(meta['compound'], 0)
+        
+        return {
+            'image': image,
+            'fingerprint': fingerprint,
+            'compound': meta['compound'],
+            'compound_idx': compound_idx,
+            'moa_idx': moa_idx,
+            'batch': meta['batch'],
+            'is_control': meta['is_control'],
+            'idx': idx,
+        }
+    
+    def _load_image(self, image_path: str) -> torch.Tensor:
+        """Load BBBC021 image."""
+        full_path = self.data_dir / image_path
+        
+        if full_path.exists():
+            try:
+                img_array = np.load(str(full_path))
+                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+                img_tensor = (img_tensor / 127.5) - 1.0
+                return img_tensor
+            except Exception as e:
+                print(f"Warning: Failed to load {full_path}: {e}")
+        
+        # Fallback: synthetic image
+        return self._generate_synthetic_image()
+    
+    def _generate_synthetic_image(self) -> torch.Tensor:
+        """Generate synthetic cell image for testing."""
+        image = np.random.randn(3, self.image_size, self.image_size).astype(np.float32)
+        image = np.clip(image, -1, 1)
+        return torch.tensor(image)
+    
+    def get_control_indices(self) -> List[int]:
+        """Get indices of all control (DMSO) samples."""
+        return [i for i, m in enumerate(self.metadata) if m['is_control']]
+    
+    def get_perturbed_indices(self) -> List[int]:
+        """Get indices of all perturbed (non-DMSO) samples."""
+        return [i for i, m in enumerate(self.metadata) if not m['is_control']]
+    
+    def get_batch_paired_sample(self, perturbed_idx: int) -> Tuple[int, int]:
+        """Get a control sample from the SAME BATCH."""
+        batch = self.metadata[perturbed_idx]['batch']
+        ctrl_indices_same_batch = self.batch_to_ctrl_indices.get(batch, [])
+        
+        if ctrl_indices_same_batch:
+            control_idx = np.random.choice(ctrl_indices_same_batch)
+        else:
+            all_ctrl = self.get_control_indices()
+            if all_ctrl:
+                control_idx = np.random.choice(all_ctrl)
+                print(f"WARNING: No controls in batch '{batch}', using random control")
+            else:
+                raise ValueError(f"No control samples available!")
+        
+        return control_idx, perturbed_idx
+
+
+class BatchPairedDataLoaderCellFlux:
+    """CellFlux-compliant DataLoader with same-batch pairing."""
+    
+    def __init__(
+        self,
+        dataset: BBBC021DatasetCellFlux,
+        batch_size: int = 128,
+        shuffle: bool = True,
+        num_workers: int = 0,
+    ):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.num_workers = num_workers
+        self.perturbed_indices = dataset.get_perturbed_indices()
+        print(f"  DataLoader: {len(self.perturbed_indices)} perturbed samples")
+    
+    def __iter__(self):
+        indices = self.perturbed_indices.copy()
+        if self.shuffle:
+            np.random.shuffle(indices)
+        
+        for start_idx in range(0, len(indices), self.batch_size):
+            batch_indices = indices[start_idx:start_idx + self.batch_size]
+            
+            controls = []
+            perturbeds = []
+            fingerprints = []
+            moa_indices = []
+            compounds = []
+            batches = []
+            
+            for perturbed_idx in batch_indices:
+                control_idx, perturbed_idx = self.dataset.get_batch_paired_sample(perturbed_idx)
+                
+                control_data = self.dataset[control_idx]
+                perturbed_data = self.dataset[perturbed_idx]
+                
+                controls.append(control_data['image'])
+                perturbeds.append(perturbed_data['image'])
+                fingerprints.append(perturbed_data['fingerprint'])
+                moa_indices.append(perturbed_data['moa_idx'])
+                compounds.append(perturbed_data['compound'])
+                batches.append(perturbed_data['batch'])
+            
+            yield {
+                'control': torch.stack(controls),
+                'perturbed': torch.stack(perturbeds),
+                'fingerprint': torch.stack(fingerprints),
+                'moa_idx': torch.tensor(moa_indices),
+                'compound': compounds,
+                'batch': batches,
+            }
+    
+    def __len__(self):
+        return (len(self.perturbed_indices) + self.batch_size - 1) // self.batch_size
+
+
+def load_cellflux_splits(csv_path: str, data_dir: str, chem_encoder=None, 
+                         exclude_ood_from_train: bool = False):
+    """Load BBBC021 data following CellFlux split logic exactly."""
+    print("=" * 60)
+    print("Loading BBBC021 with CellFlux-Compliant Split Logic")
+    print("=" * 60)
+    
+    df = pd.read_csv(csv_path)
+    
+    # Verify required columns
+    required_cols = ['SPLIT', 'CPD_NAME', 'BATCH']
+    for col in required_cols:
+        if col not in df.columns:
+            alt_col = col.lower()
+            if alt_col in df.columns:
+                df[col] = df[alt_col]
+            else:
+                raise ValueError(f"CSV must have '{col}' column")
+    
+    # Add STATE column if missing
+    if 'STATE' not in df.columns:
+        df['STATE'] = (df['CPD_NAME'].str.upper() != 'DMSO').astype(int)
+    
+    # Print statistics
+    print(f"\nDataset Statistics:")
+    print(f"  Total samples: {len(df)}")
+    print(f"  Train samples: {(df['SPLIT'].str.lower() == 'train').sum()}")
+    print(f"  Test samples: {(df['SPLIT'].str.lower() == 'test').sum()}")
+    print(f"  Treated (STATE=1): {(df['STATE'] == 1).sum()}")
+    print(f"  Control (STATE=0): {(df['STATE'] == 0).sum()}")
+    print(f"  Unique compounds: {df['CPD_NAME'].nunique()}")
+    print(f"  Unique batches: {df['BATCH'].nunique()}")
+    if 'ANNOT' in df.columns:
+        print(f"  MoA classes: {df['ANNOT'].nunique()}")
+    
+    # Create datasets
+    train_dataset = BBBC021DatasetCellFlux(
+        data_dir=data_dir,
+        metadata_df=df,
+        split="train",
+        chem_encoder=chem_encoder,
+        exclude_ood=exclude_ood_from_train,
+    )
+    
+    test_dataset = BBBC021DatasetCellFlux(
+        data_dir=data_dir,
+        metadata_df=df,
+        split="test",
+        chem_encoder=chem_encoder,
+        exclude_ood=False,
+    )
+    
+    info = {
+        'total_samples': len(df),
+        'train_samples': len(train_dataset),
+        'test_samples': len(test_dataset),
+        'train_batches': list(train_dataset.batch_to_indices.keys()),
+        'test_batches': list(test_dataset.batch_to_indices.keys()),
+        'compounds': train_dataset.compounds,
+        'moa_classes': train_dataset.moa_classes,
+        'ood_compounds': list(CELLFLUX_OOD_COMPOUNDS),
+    }
+    
+    train_batches = set(info['train_batches'])
+    test_batches = set(info['test_batches'])
+    overlap = train_batches & test_batches
+    if overlap:
+        print(f"\n  Note: {len(overlap)} batches appear in both train and test (expected for BBBC021)")
+    
+    print("=" * 60)
+    
+    return train_dataset, test_dataset, info
 
 
 # ============================================================================
@@ -2385,16 +2865,100 @@ class BBBC021AblationRunner:
         # Global model directory
         os.makedirs(config.global_model_dir, exist_ok=True)
         
-        # Load dataset
-        print("Loading BBBC021 dataset...")
-        self.train_dataset = BBBC021Dataset(
-            config.data_dir, config.metadata_file,
-            config.image_size, split="train"
-        )
-        self.val_dataset = BBBC021Dataset(
-            config.data_dir, config.metadata_file,
-            config.image_size, split="val"
-        )
+        # Load dataset with batch-aware splits
+        print("Loading BBBC021 dataset with batch-aware splits...")
+        
+        # 1. Load full metadata CSV
+        metadata_path = os.path.join(config.data_dir, config.metadata_file)
+        if not os.path.exists(metadata_path):
+            # Try alternative paths
+            if os.path.exists(config.metadata_file):
+                metadata_path = config.metadata_file
+            else:
+                raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        
+        print(f"  Reading metadata from: {metadata_path}")
+        full_df = pd.read_csv(metadata_path)
+        
+        # Ensure required columns exist
+        if "BATCH" not in full_df.columns:
+            raise ValueError("CSV must have 'BATCH' column")
+        if "CPD_NAME" not in full_df.columns:
+            raise ValueError("CSV must have 'CPD_NAME' column")
+        if "STATE" not in full_df.columns:
+            # Infer STATE from compound name (0 = DMSO, 1 = treated)
+            full_df["STATE"] = (full_df["CPD_NAME"] != "DMSO").astype(int)
+        
+        # 2. Create splits (either CellFlux-style or held-out validation)
+        if config.follow_cellflux:
+            # Use CellFlux-compliant loading
+            print("\n=== Using CellFlux-Compliant Split Logic ===")
+            
+            # Initialize chemical encoder
+            chem_encoder = MoLFormerEncoder(device='cpu')
+            
+            # Load using CellFlux-compliant function
+            train_dataset_cf, test_dataset_cf, split_info = load_cellflux_splits(
+                metadata_path,
+                config.data_dir,
+                chem_encoder=chem_encoder,
+                exclude_ood_from_train=False  # OOD compounds NOT excluded from training
+            )
+            
+            # CellFlux-style: VAL = TEST (for monitoring only, not tuning)
+            self.train_dataset = train_dataset_cf
+            self.val_dataset = test_dataset_cf  # VAL == TEST
+            self.test_dataset = test_dataset_cf
+            
+            print("CellFlux mode: VAL == TEST (for monitoring, not tuning)")
+            print("=" * 40 + "\n")
+        else:
+            # Use batch-aware held-out validation
+            train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, seed=config.seed)
+            print("\n=== Batch-Aware Split Summary ===")
+            
+            # 3. Print split summary
+            split_summary("TRAIN", train_df)
+            split_summary("VAL", val_df)
+            split_summary("TEST", test_df)
+            
+            # Verify no batch leakage
+            train_batches = set(train_df["BATCH"].unique()) if len(train_df) > 0 else set()
+            val_batches = set(val_df["BATCH"].unique()) if len(val_df) > 0 else set()
+            overlap = train_batches & val_batches
+            if overlap:
+                print(f"WARNING: TRAIN∩VAL batch overlap: {overlap}")
+            else:
+                print("✓ TRAIN and VAL batches are disjoint (no leakage)")
+            print("=" * 40 + "\n")
+            
+            # 4. Save splits as temporary CSVs
+            temp_dir = os.path.join(self.output_dir, "temp_splits")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            train_csv = os.path.join(temp_dir, "train.csv")
+            val_csv = os.path.join(temp_dir, "val.csv")
+            test_csv = os.path.join(temp_dir, "test.csv")
+            
+            train_df.to_csv(train_csv, index=False)
+            val_df.to_csv(val_csv, index=False)
+            test_df.to_csv(test_csv, index=False)
+            
+            print(f"  Saved splits to: {temp_dir}")
+            
+            # 5. Load datasets with split-specific CSVs
+            self.train_dataset = BBBC021Dataset(
+                config.data_dir, train_csv,
+                config.image_size, split="train"
+            )
+            self.val_dataset = BBBC021Dataset(
+                config.data_dir, val_csv,
+                config.image_size, split="val"
+            )
+            self.test_dataset = BBBC021Dataset(
+                config.data_dir, test_csv,
+                config.image_size, split="test"
+            )
         
         # Initialize wandb
         if config.use_wandb and WANDB_AVAILABLE:
@@ -2523,20 +3087,31 @@ class BBBC021AblationRunner:
         print("=" * 60)
         
         # Try to load from latest CSV first (more reliable for resumed runs)
-        csv_metrics = self._load_latest_metrics_from_csv(self.plots_dir, 'Pretraining')
+        # In CellFlux mode, load final epoch metrics (not best) to avoid test leakage
+        if self.config.follow_cellflux:
+            csv_metrics = self._load_final_metrics_from_csv(self.plots_dir, 'Pretraining')
+        else:
+            csv_metrics = self._load_latest_metrics_from_csv(self.plots_dir, 'Pretraining')
+        
+        # In CellFlux mode, report "Final" metrics (last epoch), not "Best" (to avoid test leakage)
+        metric_label = "Final" if self.config.follow_cellflux else "Best"
         
         if csv_metrics:
             # Use CSV metrics (most recent data)
-            print(f"Best Epoch: {int(csv_metrics.get('epoch', 0))}")
-            print(f"Best FID:   {csv_metrics.get('fid', 0.0):.2f}")
+            print(f"{metric_label} Epoch: {int(csv_metrics.get('epoch', 0))}")
+            print(f"{metric_label} FID:   {csv_metrics.get('fid', 0.0):.2f}")
             print(f"Baseline KL: {csv_metrics.get('kl_div_total', 0.0):.4f}")
             print(f"Final Loss:  {csv_metrics.get('loss', 0.0):.4f}")
+            if self.config.follow_cellflux:
+                print("  [CellFlux Mode] Reporting final epoch metrics (not best) to avoid test leakage")
         elif best_pretrain_metrics['fid'] != float('inf'):
             # Fallback to in-memory metrics (current session)
-            print(f"Best Epoch: {best_pretrain_metrics['epoch']}")
-            print(f"Best FID:   {best_pretrain_metrics['fid']:.2f}")
+            print(f"{metric_label} Epoch: {best_pretrain_metrics['epoch']}")
+            print(f"{metric_label} FID:   {best_pretrain_metrics['fid']:.2f}")
             print(f"Baseline KL: {best_pretrain_metrics['kl']:.4f}")
             print(f"Final Loss:  {best_pretrain_metrics['loss']:.4f}")
+            if self.config.follow_cellflux:
+                print("  [CellFlux Mode] Reporting final epoch metrics (not best) to avoid test leakage")
         else:
             print("Metrics not recorded (Pretraining skipped or < 10 epochs run).")
             print("Assuming converged model loaded from checkpoint.")
@@ -2754,8 +3329,14 @@ class BBBC021AblationRunner:
                 
                 print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used}): {fid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
-                # Update Best Metrics
-                if fid_score < best_metrics['fid']:
+                # Update Best Metrics (ONLY in held-out validation mode, NOT in CellFlux mode)
+                # In CellFlux mode, val==test, so tracking "best" would create test leakage
+                if not self.config.follow_cellflux:
+                    if fid_score < best_metrics['fid']:
+                        best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
+                else:
+                    # CellFlux mode: Just track current metrics for logging, but don't use for selection
+                    # The final model (last epoch) is what we report
                     best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
 
                 # Save metrics to CSV
@@ -2774,6 +3355,26 @@ class BBBC021AblationRunner:
 
             # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
+        
+        # Final evaluation at last epoch (for CellFlux mode reporting)
+        if self.config.follow_cellflux and (target_epoch - 1) % 150 != 0:
+            # If we didn't evaluate at the final epoch, do it now
+            print(f"\n  [CellFlux Mode] Running final evaluation at epoch {target_epoch}...")
+            metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
+            fid_score = metrics.get('fid', 0.0)
+            kl_score = metrics.get('kl_div_total', 0.0)
+            avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+            
+            # Update best_metrics with final epoch (for reporting)
+            best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': target_epoch}
+            
+            # Save final metrics
+            metrics['epoch'] = target_epoch
+            metrics['loss'] = avg_loss
+            metrics['phase'] = 'pretraining'
+            self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
+            
+            print(f"  Final Epoch {target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KL: {kl_score:.4f}")
             
         return ddpm, best_metrics
     
@@ -3465,22 +4066,85 @@ class BBBC021AblationRunner:
                 
                 if best_row:
                     # Convert string values to appropriate types
-                    result = {}
-                    for key, value in best_row.items():
+                    for k, v in best_row.items():
                         try:
-                            # Try to convert to float first
+                            best_row[k] = float(v)
+                        except (ValueError, TypeError):
+                            pass
+                    return best_row
+        
+        except Exception as e:
+            print(f"Warning: Failed to load metrics from CSV: {e}")
+            return None
+        
+        return None
+    
+    def _load_final_metrics_from_csv(self, checkpoint_dir: str, method: str) -> Optional[Dict]:
+        """
+        Load the final epoch metrics from the most recent CSV file (for CellFlux mode).
+        Returns the row with the highest epoch number, or None if no CSV found.
+        This avoids test leakage by not selecting "best" metrics based on test set.
+        """
+        # Find all CSV files for this method (same logic as _load_latest_metrics_from_csv)
+        base_pattern = f"{method}_metrics"
+        csv_files = []
+        
+        base_path = os.path.join(checkpoint_dir, f"{base_pattern}.csv")
+        if os.path.exists(base_path):
+            csv_files.append((0, base_path))
+        
+        counter = 1
+        while True:
+            versioned_path = os.path.join(checkpoint_dir, f"{base_pattern}_{counter}.csv")
+            if os.path.exists(versioned_path):
+                csv_files.append((counter, versioned_path))
+                counter += 1
+            else:
+                break
+        
+        if not csv_files:
+            return None
+        
+        csv_files.sort(key=lambda x: x[0], reverse=True)
+        latest_file = csv_files[0][1]
+        
+        try:
+            with open(latest_file, 'r', newline='') as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                
+                if not rows:
+                    return None
+                
+                # Find row with final (highest) epoch
+                final_row = None
+                final_epoch = -1
+                
+                for row in rows:
+                    try:
+                        epoch = float(row.get('epoch', -1))
+                        if epoch > final_epoch:
+                            final_epoch = epoch
+                            final_row = row
+                    except (ValueError, TypeError):
+                        continue
+                
+                if final_row:
+                    # Convert string values to appropriate types
+                    result = {}
+                    for key, value in final_row.items():
+                        try:
                             result[key] = float(value)
                         except (ValueError, TypeError):
                             try:
-                                # Try int
                                 result[key] = int(value)
                             except (ValueError, TypeError):
-                                # Keep as string
                                 result[key] = value
-                    
                     return result
+        
         except Exception as e:
-            print(f"Warning: Failed to read metrics from CSV {latest_file}: {e}")
+            print(f"Warning: Failed to load final metrics from CSV: {e}")
+            return None
         
         return None
     
@@ -4240,6 +4904,8 @@ def main():
                        help="Directory containing BBBC021 data")
     parser.add_argument("--metadata-file", type=str, default="metadata/bbbc021_df_all.csv",
                        help="Metadata CSV file")
+    parser.add_argument("--follow-cellflux", "--follow_cellflux", action="store_true",
+                       help="Match CellFlux split: use CSV SPLIT train/test; set validation=test (no held-out val)")
     
     # Training
     parser.add_argument("--ddpm-epochs", type=int, default=500,
@@ -4323,6 +4989,7 @@ def main():
         skip_optimizer_on_resume=args.skip_optimizer,
         data_dir=args.data_dir,
         metadata_file=args.metadata_file,
+        follow_cellflux=args.follow_cellflux,
         ddpm_epochs=args.ddpm_epochs,
         coupling_epochs=args.coupling_epochs,
         warmup_epochs=args.warmup_epochs,
