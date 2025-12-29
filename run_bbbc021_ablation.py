@@ -1507,12 +1507,9 @@ class ImageDDPM:
         self.use_transformer = use_transformer
         self.cfg_dropout_prob = cfg_dropout_prob
         
-        # Beta schedule
-        betas = torch.linspace(beta_start, beta_end, timesteps)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        
-        self.register_schedule(betas, alphas, alphas_cumprod)
+        # Beta schedule - Using Cosine Schedule (replaces linear for better SNR)
+        # The register_schedule method now calculates cosine schedule internally
+        self.register_schedule(None, None, None)
         
         # Model
         if use_transformer and conditional:
@@ -1558,12 +1555,27 @@ class ImageDDPM:
             self.perturbation_encoder = None
     
     def register_schedule(self, betas, alphas, alphas_cumprod):
-        """Register diffusion schedule."""
-        self.betas = betas.to(self.device)
-        self.alphas = alphas.to(self.device)
-        self.alphas_cumprod = alphas_cumprod.to(self.device)
-        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).to(self.device)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).to(self.device)
+        """
+        Register diffusion schedule with Cosine Beta Schedule.
+        Cosine schedule keeps images recognizable longer, giving the model more useful timesteps.
+        """
+        # Cosine Beta Schedule (replaces linear schedule)
+        def cosine_beta_schedule(timesteps, s=0.008):
+            """Cosine schedule as proposed in Improved DDPM."""
+            steps = timesteps + 1
+            x = torch.linspace(0, timesteps, steps, device=self.device)
+            alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return torch.clip(betas, 0.0001, 0.9999)
+        
+        # Calculate cosine schedule
+        self.betas = cosine_beta_schedule(self.timesteps)
+        self.alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
+        
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).to(self.device)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod).to(self.device)
     
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
         """Forward diffusion: q(x_t | x_0)"""
@@ -1632,8 +1644,18 @@ class ImageDDPM:
         else:
             noise_pred = self.model(x_t, t)
         
-        # Loss
-        loss = F.mse_loss(noise_pred, noise)
+        # [MODIFIED] Min-SNR Loss Weighting (Focuses on hard timesteps)
+        # Calculate SNR for this batch: SNR(t) = alpha_bar_t / (1 - alpha_bar_t)
+        alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1, 1, 1)
+        snr = alpha_cumprod_t / (1.0 - alpha_cumprod_t + 1e-8)  # Add epsilon to avoid division by zero
+        
+        # Min-SNR Weighting (Gamma=5.0 is standard for images)
+        gamma = 5.0
+        mse_loss_weights = torch.clamp(snr, max=gamma) / (snr + 1e-8)
+        
+        # Weighted Loss (per-sample, then mean)
+        loss = F.mse_loss(noise_pred, noise, reduction='none')
+        loss = (loss.mean(dim=[1, 2, 3]) * mse_loss_weights.squeeze()).mean()
         
         # Backward
         self.optimizer.zero_grad()
@@ -2687,6 +2709,10 @@ class BBBC021AblationRunner:
         print(f"  [Incremental] Resuming from Epoch {start_epoch}. Training for {epochs_to_train} epochs.")
         print(f"  [Incremental] Target Epoch: {target_epoch}")
 
+        # [NEW] Cosine Annealing LR Scheduler (allows convergence to global minimum)
+        from torch.optim.lr_scheduler import CosineAnnealingLR
+        scheduler = CosineAnnealingLR(ddpm.optimizer, T_max=epochs_to_train, eta_min=1e-6)
+
         # 2. Use Full Dataset
         dataloader = DataLoader(
             self.train_dataset, 
@@ -2718,8 +2744,8 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 10 epochs)
-            if (epoch + 1) % 10 == 0:
+            # 2. Evaluate (Every 150 epochs)
+            if (epoch + 1) % 150 == 0:
                 metrics = self._evaluate_pretrain(ddpm, self.train_dataset)
                 fid_score = metrics.get('fid', 0.0)
                 kl_score = metrics.get('kl_div_total', 0.0)
@@ -2739,6 +2765,12 @@ class BBBC021AblationRunner:
                 self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
             else:
                 print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f}")
+
+            # [NEW] Step the Cosine Annealing LR Scheduler
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            if (epoch + 1) % 150 == 0:  # Print LR every 150 epochs (same as evaluation)
+                print(f"    Current LR: {current_lr:.2e}")
 
             # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
