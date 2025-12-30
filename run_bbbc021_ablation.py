@@ -3307,9 +3307,9 @@ class BBBC021AblationRunner:
         # Determine model size based on flag
         if self.config.scale_up_uvit and self.config.use_transformer:
             print(">>> SCALING UP UViT: Using Large Backbone (Embed=1024, Depth=24, Heads=16)")
-            embed_dim = 1024
-            depth = 24
-            num_heads = 16
+            embed_dim = 768
+            depth = 16
+            num_heads = 12
         else:
             embed_dim = 512
             depth = 12
