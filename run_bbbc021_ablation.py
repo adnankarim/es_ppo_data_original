@@ -3404,7 +3404,7 @@ class BBBC021AblationRunner:
             gpu_stats = self._get_gpu_stats()
 
             # 2. Evaluate (Every 150 epochs)
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 1 == 0:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
@@ -3438,7 +3438,7 @@ class BBBC021AblationRunner:
             # [NEW] Step the Cosine Annealing LR Scheduler
             scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
-            if (epoch + 1) % 150 == 0:  # Print LR every 150 epochs (same as evaluation)
+            if (epoch + 1) % 2 == 0:  # Print LR every 150 epochs (same as evaluation)
                 print(f"    Current LR: {current_lr:.2e}")
 
             # 3. Checkpoint
