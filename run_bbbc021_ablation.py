@@ -250,6 +250,8 @@ class BBBC021Config:
     
     # Model architecture
     use_transformer: bool = False  # Use U-ViT Transformer backbone instead of U-Net
+    scale_up_uvit: bool = False  # Use larger UViT (Depth 24, Dim 1024) for GH200
+    use_ema: bool = False  # Enable Exponential Moving Average for smoother weights
     
     # CFG Settings (Matches DDMEC Paper)
     cfg_dropout_prob: float = 0.1  # 10% chance to drop condition during training
@@ -1942,6 +1944,37 @@ class UViT(nn.Module):
 # DDPM FOR IMAGES
 # ============================================================================
 
+class EMA:
+    """
+    Exponential Moving Average for model parameters.
+    Standard practice for SOTA diffusion models to stabilize generation.
+    """
+    def __init__(self, beta):
+        self.beta = beta
+        self.step = 0
+
+    def update_model_average(self, ma_model, current_model):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            old_weight, new_weight = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old_weight, new_weight)
+
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+    def step_ema(self, ema_model, model, step_start_ema=2000):
+        if self.step < step_start_ema:
+            self.reset_parameters(ema_model, model)
+            self.step += 1
+            return
+        self.update_model_average(ema_model, model)
+        self.step += 1
+
+    def reset_parameters(self, ema_model, model):
+        ema_model.load_state_dict(model.state_dict())
+
+
 class ImageDDPM:
     """DDPM for image generation with U-Net or U-ViT Transformer backbone."""
     
@@ -1961,6 +1994,8 @@ class ImageDDPM:
         fingerprint_input_dim: int = 768,  # MoLFormer uses 768, Morgan uses 1024
         use_transformer: bool = False,  # Use U-ViT instead of U-Net
         cfg_dropout_prob: float = 0.1,  # CFG dropout probability during training
+        use_ema: bool = False,  # Enable Exponential Moving Average
+        ema_decay: float = 0.9999,  # EMA decay rate
     ):
         self.image_size = image_size
         self.in_channels = in_channels
@@ -1969,6 +2004,8 @@ class ImageDDPM:
         self.conditional = conditional
         self.use_transformer = use_transformer
         self.cfg_dropout_prob = cfg_dropout_prob
+        self.use_ema = use_ema
+        self.ema = EMA(ema_decay) if use_ema else None
         
         # Beta schedule - Using Cosine Schedule (replaces linear for better SNR)
         # The register_schedule method now calculates cosine schedule internally
@@ -1977,13 +2014,14 @@ class ImageDDPM:
         # Model
         if use_transformer and conditional:
             # Use U-ViT Transformer backbone
+            # Default size (can be overridden in _pretrain_ddpm for scale_up_uvit)
             self.model = UViT(
                 img_size=image_size,
                 in_channels=in_channels,
                 patch_size=4,
-                embed_dim=512,  # Tune this for GPU memory (256, 512, 768)
-                depth=12,
-                num_heads=8,
+                embed_dim=512,  # Default: 512 (scaled to 1024 if scale_up_uvit)
+                depth=12,  # Default: 12 (scaled to 24 if scale_up_uvit)
+                num_heads=8,  # Default: 8 (scaled to 16 if scale_up_uvit)
                 cond_emb_dim=cond_emb_dim,
                 time_emb_dim=time_emb_dim
             ).to(self.device)
@@ -2007,6 +2045,16 @@ class ImageDDPM:
             ).to(self.device)
         
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        
+        # Initialize EMA model if enabled
+        if self.use_ema:
+            import copy
+            self.ema_model = copy.deepcopy(self.model)
+            # Freeze EMA model (it is updated manually, not by optimizer)
+            for p in self.ema_model.parameters():
+                p.requires_grad = False
+        else:
+            self.ema_model = None
         
         # Perturbation encoder
         if conditional:
@@ -2126,6 +2174,10 @@ class ImageDDPM:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         
+        # [NEW] Update EMA model
+        if self.use_ema:
+            self.ema.step_ema(self.ema_model, self.model)
+        
         return loss.item()
     
     @torch.no_grad()
@@ -2138,7 +2190,9 @@ class ImageDDPM:
         guidance_scale: float = 4.0,  # CFG guidance scale
     ) -> torch.Tensor:
         """Sample from the model with Classifier-Free Guidance."""
-        self.model.eval()
+        # [NEW] Switch to EMA model for sampling if enabled
+        inference_model = self.ema_model if (self.use_ema and self.ema_model is not None) else self.model
+        inference_model.eval()
         
         if num_steps is None:
             num_steps = self.timesteps
@@ -2165,19 +2219,19 @@ class ImageDDPM:
             # Predict noise with CFG extrapolation
             if self.conditional and guidance_scale > 1.0:
                 # A. Conditional Pass
-                noise_cond = self.model(x, t, control, cond_emb)
+                noise_cond = inference_model(x, t, control, cond_emb)
                 
                 # B. Unconditional Pass
-                noise_uncond = self.model(x, t, control, uncond_emb)
+                noise_uncond = inference_model(x, t, control, uncond_emb)
                 
                 # C. Extrapolate (CFG Formula)
                 # noise = noise_uncond + s * (noise_cond - noise_uncond)
                 noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
             elif self.conditional:
                 # Standard conditional sampling (s=1.0)
-                noise_pred = self.model(x, t, control, cond_emb)
+                noise_pred = inference_model(x, t, control, cond_emb)
             else:
-                noise_pred = self.model(x, t)
+                noise_pred = inference_model(x, t)
             
             # Clamp noise prediction
             noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
@@ -3250,6 +3304,17 @@ class BBBC021AblationRunner:
     
     def _pretrain_ddpm(self) -> Tuple[ImageDDPM, Dict]:
         """[FIXED] Conditional Marginal Pretraining with INCREMENTAL Logic."""
+        # Determine model size based on flag
+        if self.config.scale_up_uvit and self.config.use_transformer:
+            print(">>> SCALING UP UViT: Using Large Backbone (Embed=1024, Depth=24, Heads=16)")
+            embed_dim = 1024
+            depth = 24
+            num_heads = 16
+        else:
+            embed_dim = 512
+            depth = 12
+            num_heads = 8
+        
         # 1. Initialize Conditional Model
         ddpm = ImageDDPM(
             image_size=self.config.image_size,
@@ -3264,7 +3329,29 @@ class BBBC021AblationRunner:
             fingerprint_input_dim=self.fingerprint_dim,  # Dynamic dimension (1024 for Morgan, 768 for MoLFormer)
             use_transformer=self.config.use_transformer,
             cfg_dropout_prob=self.config.cfg_dropout_prob,
+            use_ema=self.config.use_ema,  # Pass the new flag
         )
+        
+        # [CRITICAL HACK] If scale_up_uvit is enabled, re-initialize the internal model
+        if self.config.scale_up_uvit and self.config.use_transformer:
+            ddpm.model = UViT(
+                img_size=self.config.image_size,
+                in_channels=self.config.num_channels,
+                patch_size=4,
+                embed_dim=embed_dim,  # SCALED
+                depth=depth,  # SCALED
+                num_heads=num_heads,  # SCALED
+                cond_emb_dim=self.config.perturbation_embed_dim,
+                time_emb_dim=self.config.time_embed_dim
+            ).to(self.config.device)
+            # Re-init optimizer for the new model
+            ddpm.optimizer = torch.optim.AdamW(ddpm.model.parameters(), lr=self.config.ddpm_lr)
+            if self.config.use_ema:
+                import copy
+                ddpm.ema_model = copy.deepcopy(ddpm.model)
+                # Freeze EMA model
+                for p in ddpm.ema_model.parameters():
+                    p.requires_grad = False
         
         # Try to load checkpoint
         start_epoch = self._load_checkpoint_if_exists(ddpm, ddpm.optimizer, "ddpm_pretrain_latest.pt", skip_optimizer=self.config.skip_optimizer_on_resume)
@@ -4986,6 +5073,10 @@ def main():
                        help="Train pretrained model from scratch")
     parser.add_argument("--use-transformer", action="store_true",
                        help="Use U-ViT Transformer backbone instead of U-Net (better for global coordination)")
+    parser.add_argument("--scale-up-uvit", action="store_true",
+                       help="Use a larger Transformer backbone (Depth 24, Dim 1024) for GH200")
+    parser.add_argument("--use-ema", action="store_true",
+                       help="Enable Exponential Moving Average for smoother weights (Standard SOTA practice)")
     
     # CFG Settings
     parser.add_argument("--cfg-dropout-prob", type=float, default=0.1,
@@ -5038,6 +5129,8 @@ def main():
         seed=args.seed,
         reuse_pretrained=not args.no_reuse_pretrained,
         use_transformer=args.use_transformer,
+        scale_up_uvit=args.scale_up_uvit,
+        use_ema=args.use_ema,
         cfg_dropout_prob=args.cfg_dropout_prob,
         guidance_scale=args.guidance_scale,
         enable_bio_loss=args.enable_bio_loss,
