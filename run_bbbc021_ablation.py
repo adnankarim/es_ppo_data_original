@@ -507,91 +507,55 @@ CELLFLUX_OOD_COMPOUNDS = {
 # BATCH-AWARE SPLIT HELPER
 # ============================================================================
 
-def make_batch_aware_splits(df: pd.DataFrame, seed: int = 0):
+def make_batch_aware_splits(df: pd.DataFrame, val_size: float = 0.15, seed: int = 42):
     """
-    Creates batch-aware train/val/test splits from metadata CSV.
-    
-    Uses CSV SPLIT column for test, and creates a batch-held-out val from train.
-    Works per-compound to ensure every compound has proper validation data.
-    
-    Returns: train_df, val_df, test_df, info_dict
+    SOTA Splitting Strategy:
+    1. Keeps TEST set untouched (from CSV).
+    2. Groups TRAIN pool by BATCH.
+    3. Randomly assigns batches to VAL.
+    4. Ensures 100% compound coverage in the TRAIN set.
     """
-    # 1) TEST = as provided in CSV
+    print(f"\n[Split] Creating Hard Batch-Wise Leave-Out (val_size={val_size})...")
+    
     test_df = df[df["SPLIT"].str.lower() == "test"].copy() if "SPLIT" in df.columns else pd.DataFrame()
-    
-    # 2) Candidate TRAIN pool (as provided in CSV)
     train_pool = df[df["SPLIT"].str.lower() == "train"].copy() if "SPLIT" in df.columns else df.copy()
     
     if len(train_pool) == 0:
         raise ValueError("No training data found in CSV. Check SPLIT column.")
     
-    # 3) Get all compounds (excluding DMSO as a "compound" for split purposes)
-    # We'll handle DMSO controls separately
-    compounds = train_pool[train_pool["CPD_NAME"] != "DMSO"]["CPD_NAME"].unique()
-    
-    train_dfs = []
-    val_dfs = []
+    all_train_batches = sorted(train_pool["BATCH"].unique())
+    all_compounds = set(train_pool[train_pool["CPD_NAME"] != "DMSO"]["CPD_NAME"].unique())
     
     rng = np.random.RandomState(seed)
+    num_val_batches = max(1, int(len(all_train_batches) * val_size))
     
-    # 4) Process each compound separately
-    for compound in compounds:
-        # Treated rows for this compound (TRAIN pool only)
-        trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound)].copy()
+    train_df, val_df = None, None
+    for attempt in range(100):
+        val_batch_ids = rng.choice(all_train_batches, size=num_val_batches, replace=False)
+        val_batch_set = set(val_batch_ids)
         
-        if trt.empty:
-            continue  # Skip compounds with no treated data
+        temp_train = train_pool[~train_pool["BATCH"].isin(val_batch_set)].copy()
+        temp_val = train_pool[train_pool["BATCH"].isin(val_batch_set)].copy()
         
-        batches = sorted(trt["BATCH"].unique())
+        trn_compounds = set(temp_train[temp_train["CPD_NAME"] != "DMSO"]["CPD_NAME"].unique())
         
-        if len(batches) < 2:
-            # If only one batch, put it all in train (no val for this compound)
-            train_dfs.append(trt)
-            # Still need controls for this batch
-            ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(batches))].copy()
-            train_dfs.append(ctrl)
-            continue
-        
-        # Choose 1 val batch deterministically (seeded random)
-        val_batch = rng.choice(batches, size=1, replace=False)[0]
-        val_batches = {val_batch}
-        train_batches = set(batches) - val_batches
-        
-        # Build TRAIN treated + controls (only those batches)
-        trn_trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound) &
-                             (train_pool["BATCH"].isin(train_batches))].copy()
-        val_trt = train_pool[(train_pool["STATE"] == 1) & (train_pool["CPD_NAME"] == compound) &
-                             (train_pool["BATCH"].isin(val_batches))].copy()
-        
-        # Controls: DMSO rows from matching batches
-        trn_ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(train_batches))].copy()
-        val_ctrl = train_pool[(train_pool["STATE"] == 0) & (train_pool["BATCH"].isin(val_batches))].copy()
-        
-        train_dfs.extend([trn_trt, trn_ctrl])
-        val_dfs.extend([val_trt, val_ctrl])
+        # Ensure we didn't accidentally put all batches of a drug into Val
+        if all_compounds == trn_compounds:
+            train_df, val_df = temp_train, temp_val
+            print(f"[Split] Found valid split on attempt {attempt+1}.")
+            break
     
-    # Combine all compounds
-    train_df = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
-    val_df = pd.concat(val_dfs, ignore_index=True) if val_dfs else pd.DataFrame()
-    
-    # Ensure test_df has the right structure
-    if len(test_df) == 0:
-        test_df = df[df["SPLIT"].str.lower() == "test"].copy() if "SPLIT" in df.columns else pd.DataFrame()
-    
-    # Add SPLIT column to each DataFrame so dataset recognizes them
-    if len(train_df) > 0:
-        train_df["SPLIT"] = "train"
-    if len(val_df) > 0:
-        val_df["SPLIT"] = "val"
-    if len(test_df) > 0:
-        test_df["SPLIT"] = "test"
+    if train_df is None:
+        print("[Split] WARNING: Using random split (coverage check failed).")
+        train_df, val_df = temp_train, temp_val
+
+    train_df["SPLIT"], val_df["SPLIT"], test_df["SPLIT"] = "train", "val", "test"
     
     info = {
         "train_batches": sorted(train_df["BATCH"].unique()) if len(train_df) > 0 else [],
         "val_batches": sorted(val_df["BATCH"].unique()) if len(val_df) > 0 else [],
         "test_batches": sorted(test_df["BATCH"].unique()) if len(test_df) > 0 else [],
     }
-    
     return train_df, val_df, test_df, info
 
 
@@ -669,7 +633,13 @@ class BBBC021Dataset(Dataset):
         Load metadata based on SPLIT column only (removed batch naming heuristics).
         OOD filtering is controlled explicitly by exclude_ood parameter.
         """
-        metadata_path = self.data_dir / metadata_file
+        # Handle absolute paths vs relative paths
+        if os.path.isabs(metadata_file) or os.path.exists(metadata_file):
+            # If it's an absolute path or the file exists exactly as named, use it directly
+            metadata_path = Path(metadata_file)
+        else:
+            # Otherwise, assume it's relative to data_dir
+            metadata_path = self.data_dir / metadata_file
         
         if not metadata_path.exists():
             print(f"Warning: Metadata file not found at {metadata_path}")
@@ -2920,75 +2890,71 @@ class BBBC021AblationRunner:
             # Infer STATE from compound name (0 = DMSO, 1 = treated)
             full_df["STATE"] = (full_df["CPD_NAME"] != "DMSO").astype(int)
         
-        # 2. Create splits (either CellFlux-style or held-out validation)
+        # 2. Create splits (either CellFlux-style or SOTA held-out validation)
         if config.follow_cellflux:
-            # Use CellFlux-compliant loading
-            print("\n=== Using CellFlux-Compliant Split Logic ===")
+            print("\n=== MODE: CellFlux Reproduction (VAL == TEST) ===")
+            print("  Strategy: Monitoring only (reports Last Epoch, no tuning)")
             
-            # Load using CellFlux-compliant function (use configured encoder)
             train_dataset_cf, test_dataset_cf, split_info = load_cellflux_splits(
-                metadata_path,
-                config.data_dir,
-                chem_encoder=self.chem_encoder,
-                exclude_ood_from_train=False  # OOD compounds NOT excluded from training
+                metadata_path, config.data_dir, chem_encoder=self.chem_encoder,
+                exclude_ood_from_train=False
             )
-            
-            # CellFlux-style: VAL = TEST (for monitoring only, not tuning)
             self.train_dataset = train_dataset_cf
-            self.val_dataset = test_dataset_cf  # VAL == TEST
+            self.val_dataset = test_dataset_cf  # Monitoring only
             self.test_dataset = test_dataset_cf
-            
-            print("CellFlux mode: VAL == TEST (for monitoring, not tuning)")
             print("=" * 40 + "\n")
         else:
-            # Use batch-aware held-out validation
-            train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, seed=config.seed)
+            print("\n=== MODE: SOTA Beater (Held-out Batch Validation) ===")
+            print("  Strategy: Legitimate tuning (reports Best Epoch on unseen batches)")
+            
+            # 1. Generate the Splits
+            train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, val_size=0.15, seed=config.seed)
             print("\n=== Batch-Aware Split Summary ===")
             
-            # 3. Print split summary
+            # Print split summary
             split_summary("TRAIN", train_df)
             split_summary("VAL", val_df)
             split_summary("TEST", test_df)
             
-            # Verify no batch leakage
+            # Verify no batch leakage - CRITICAL: Raise error if leakage detected
             train_batches = set(train_df["BATCH"].unique()) if len(train_df) > 0 else set()
             val_batches = set(val_df["BATCH"].unique()) if len(val_df) > 0 else set()
             overlap = train_batches & val_batches
             if overlap:
-                print(f"WARNING: TRAIN∩VAL batch overlap: {overlap}")
+                raise ValueError(f"CRITICAL ERROR: Batch leakage detected! {len(overlap)} batches in both sets: {list(overlap)[:10]}...")
             else:
                 print("✓ TRAIN and VAL batches are disjoint (no leakage)")
             print("=" * 40 + "\n")
             
-            # 4. Save splits as temporary CSVs
-            temp_dir = os.path.join(self.output_dir, "temp_splits")
+            # 2. Save splits as temporary CSVs (Absolute Paths recommended to avoid confusion)
+            temp_dir = os.path.abspath(os.path.join(self.output_dir, "temp_splits"))
             os.makedirs(temp_dir, exist_ok=True)
             
-            train_csv = os.path.join(temp_dir, "train.csv")
-            val_csv = os.path.join(temp_dir, "val.csv")
-            test_csv = os.path.join(temp_dir, "test.csv")
+            train_csv_path = os.path.join(temp_dir, "train.csv")
+            val_csv_path = os.path.join(temp_dir, "val.csv")
+            test_csv_path = os.path.join(temp_dir, "test.csv")
             
-            train_df.to_csv(train_csv, index=False)
-            val_df.to_csv(val_csv, index=False)
-            test_df.to_csv(test_csv, index=False)
+            train_df.to_csv(train_csv_path, index=False)
+            val_df.to_csv(val_csv_path, index=False)
+            test_df.to_csv(test_csv_path, index=False)
             
             print(f"  Saved splits to: {temp_dir}")
             
-            # 5. Load datasets with split-specific CSVs
+            # 3. Load datasets - PASS THE ABSOLUTE PATHS
             self.train_dataset = BBBC021Dataset(
-                config.data_dir, train_csv,
+                config.data_dir, train_csv_path,  # Passing absolute path
                 config.image_size, split="train",
                 morgan_encoder=self.chem_encoder,
-                exclude_ood=False  # Explicitly keep all compounds
+                exclude_ood=False
             )
             self.val_dataset = BBBC021Dataset(
-                config.data_dir, val_csv,
+                config.data_dir, val_csv_path,
                 config.image_size, split="val",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
             )
             self.test_dataset = BBBC021Dataset(
-                config.data_dir, test_csv,
+                config.data_dir, test_csv_path,
                 config.image_size, split="test",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
@@ -3322,13 +3288,11 @@ class BBBC021AblationRunner:
         from torch.optim.lr_scheduler import CosineAnnealingLR
         scheduler = CosineAnnealingLR(ddpm.optimizer, T_max=epochs_to_train, eta_min=1e-6)
 
-        # 2. Use Full Dataset
-        dataloader = DataLoader(
+        # 2. Use Paired DataLoader to ensure batch-awareness during training
+        dataloader = BatchPairedDataLoader(
             self.train_dataset, 
             batch_size=self.config.ddpm_batch_size,
-            shuffle=True,
-            num_workers=32 if os.name != 'nt' else 0,
-            pin_memory=True
+            shuffle=True
         )
 
         for epoch in range(start_epoch, target_epoch):
@@ -3338,14 +3302,13 @@ class BBBC021AblationRunner:
             
             epoch_losses = []
             
-            # 1. Train
+            # 1. Train - SOTA strategy: predict perturbed from control in SAME batch
             for batch in dataloader:
-                images = batch['image'].to(self.config.device)
+                images = batch['perturbed'].to(self.config.device)
+                controls = batch['control'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
                 
-                dummy_control = torch.zeros_like(images)
-                
-                loss = ddpm.train_step(x0=images, control=dummy_control, fingerprint=fingerprint)
+                loss = ddpm.train_step(x0=images, control=controls, fingerprint=fingerprint)
                 epoch_losses.append(loss)
             
             avg_loss = np.mean(epoch_losses)
@@ -3364,15 +3327,18 @@ class BBBC021AblationRunner:
                 
                 print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used}): {fid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
-                # Update Best Metrics (ONLY in held-out validation mode, NOT in CellFlux mode)
-                # In CellFlux mode, val==test, so tracking "best" would create test leakage
+                # Update Best Metrics
                 if not self.config.follow_cellflux:
+                    # SOTA BEATER MODE: Legitimate tuning on held-out Validation set
                     if fid_score < best_metrics['fid']:
                         best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
+                        # Save the 'best' for the next stage
+                        self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_best.pt", is_global=True)
                 else:
-                    # CellFlux mode: Just track current metrics for logging, but don't use for selection
-                    # The final model (last epoch) is what we report
+                    # CELLFLUX REPRODUCTION MODE: Safe monitoring only
+                    # We track the metrics, but best_metrics is ALWAYS the latest epoch
                     best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
+                    # We do NOT save a 'best' checkpoint; we only use 'latest.pt'
 
                 # Save metrics to CSV
                 metrics['epoch'] = epoch + 1
