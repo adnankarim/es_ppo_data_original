@@ -885,12 +885,19 @@ class BBBC021Dataset(Dataset):
         # Load image
         image = self._load_image(meta['image_path'])
         
-        # Get perturbation embedding
-        smiles = meta.get('smiles', '')
-        if not smiles: 
-            smiles = 'DMSO'  # Fallback
-        # Returns (768,) tensor
-        fingerprint = self.chem_encoder.encode([smiles]).squeeze(0)
+        # CRITICAL FIX: Look up the precomputed CPU tensor instead of calling the GPU encoder
+        # This prevents the forked worker from needing to talk to the GPU.
+        compound = meta['compound']
+        if compound in self.fingerprints:
+            fingerprint = self.fingerprints[compound]
+        else:
+            # Fallback if specific compound wasn't pre-encoded
+            embed_dim = getattr(self.chem_encoder, 'embed_dim', 768)
+            fingerprint = self.fingerprints.get('DMSO', np.zeros(embed_dim))
+        
+        # Ensure it's a tensor (if stored as numpy)
+        if not isinstance(fingerprint, torch.Tensor):
+            fingerprint = torch.from_numpy(fingerprint).float()
         
         # Get labels
         moa_idx = self.moa_to_idx.get(meta['moa'], 0)
@@ -1597,15 +1604,19 @@ class BBBC021DatasetCellFlux(Dataset):
         # Load image
         image = self._load_image(meta['image_path'])
         
-        # Get perturbation embedding
-        smiles = meta.get('smiles', '')
-        if not smiles:
-            smiles = 'DMSO'
-        
-        if hasattr(self.chem_encoder, 'encode'):
-            fingerprint = self.chem_encoder.encode([smiles]).squeeze(0)
+        # CRITICAL FIX: Look up the precomputed CPU tensor instead of calling the GPU encoder
+        # This prevents the forked worker from needing to talk to the GPU.
+        compound = meta['compound']
+        if compound in self.fingerprints:
+            fingerprint = self.fingerprints[compound]
         else:
-            fingerprint = torch.tensor(self.chem_encoder.encode(smiles), dtype=torch.float32)
+            # Fallback if specific compound wasn't pre-encoded
+            embed_dim = getattr(self.chem_encoder, 'embed_dim', 768)
+            fingerprint = self.fingerprints.get('DMSO', np.zeros(embed_dim))
+        
+        # Ensure it's a tensor (if stored as numpy)
+        if not isinstance(fingerprint, torch.Tensor):
+            fingerprint = torch.from_numpy(fingerprint).float()
         
         moa_idx = self.moa_to_idx.get(meta['moa'], 0)
         compound_idx = self.compound_to_idx.get(meta['compound'], 0)
@@ -4905,6 +4916,11 @@ Learned Statistics:
 # ============================================================================
 
 def main():
+    # FIX: Set multiprocessing start method to 'spawn' to avoid CUDA fork errors
+    import torch.multiprocessing as mp
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method('spawn', force=True)
+    
     parser = argparse.ArgumentParser(
         description="BBBC021 Unified Runner: Ablation & Single Experiment with Resume",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
