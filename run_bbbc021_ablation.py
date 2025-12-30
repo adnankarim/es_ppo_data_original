@@ -179,51 +179,42 @@ class BioPerceptualLoss(nn.Module):
 class MoLFormerEncoder:
     """
     Replaces Morgan Fingerprints with Chemical Language Model Embeddings.
-    Uses ChemBERTa (lighter) or MoLFormer to understand chemical structure.
+    Uses ChemBERTa/MoLFormer to understand chemical structure.
     """
-    def __init__(self, device='cpu'):
-        self.device = device
+    def __init__(self, device='cuda'):
+        self.device = torch.device(device)
         self.cache = {}
+        
         if TRANSFORMERS_AVAILABLE:
-            print("Loading ChemBERTa for Chemical Embeddings...")
-            # Using ChemBERTa for speed. For full power, use 'ibm/MoLFormer-XL-75b'
+            print(f"Loading MoLFormer/ChemBERTa on {self.device}...")
+            # Using ChemBERTa for efficiency; switch to 'ibm/MoLFormer-XL-75b' for max power
             model_name = "seyonec/ChemBERTa-zinc-base-v1" 
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModel.from_pretrained(model_name).to(device)
+            self.model = AutoModel.from_pretrained(model_name).to(self.device)
             self.model.eval()
-            self.embed_dim = 768 # Standard for Base Transformers
+            self.embed_dim = 768 
         else:
-            self.embed_dim = 1024 # Fallback to Morgan size
+            print("Transformers not installed. Using random fallback.")
+            self.embed_dim = 1024
 
-    def encode(self, smiles_list):
+    def encode(self, smiles_list: Any):
         """
         Batch encode SMILES strings.
-        Returns: Tensor (B, 768)
+        Returns: Tensor (B, 768) on the device the model is on.
         """
         if not TRANSFORMERS_AVAILABLE:
-            # Fallback to random noise if transformers missing
-            return torch.randn(len(smiles_list), self.embed_dim).to(self.device)
+            return torch.randn(len(smiles_list) if isinstance(smiles_list, list) else 1, self.embed_dim).to(self.device)
 
         if isinstance(smiles_list, str): 
             smiles_list = [smiles_list]
         
-        # Check cache to speed up training
-        uncached = [s for s in smiles_list if s not in self.cache]
-        
-        if uncached:
-            with torch.no_grad():
-                # Tokenize
-                inputs = self.tokenizer(uncached, return_tensors="pt", padding=True, truncation=True).to(self.device)
-                outputs = self.model(**inputs)
-                # Use CLS token (index 0) as the chemical summary
-                embeddings = outputs.last_hidden_state[:, 0, :]
-                
-                for s, emb in zip(uncached, embeddings):
-                    self.cache[s] = emb.cpu() # Store on CPU to save GPU RAM
-        
-        # Assemble batch
-        batch_emb = torch.stack([self.cache[s] for s in smiles_list]).to(self.device)
-        return batch_emb
+        with torch.no_grad():
+            # Tokenize and move to GPU
+            inputs = self.tokenizer(smiles_list, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            outputs = self.model(**inputs)
+            # Use CLS token as the chemical summary
+            embeddings = outputs.last_hidden_state[:, 0, :]
+            return embeddings
 
 
 # ============================================================================
@@ -412,51 +403,42 @@ class BioPerceptualLoss(nn.Module):
 class MoLFormerEncoder:
     """
     Replaces Morgan Fingerprints with Chemical Language Model Embeddings.
-    Uses ChemBERTa (lighter) or MoLFormer to understand chemical structure.
+    Uses ChemBERTa/MoLFormer to understand chemical structure.
     """
-    def __init__(self, device='cpu'):
-        self.device = device
+    def __init__(self, device='cuda'):
+        self.device = torch.device(device)
         self.cache = {}
+        
         if TRANSFORMERS_AVAILABLE:
-            print("Loading ChemBERTa for Chemical Embeddings...")
-            # Using ChemBERTa for speed. For full power, use 'ibm/MoLFormer-XL-75b'
+            print(f"Loading MoLFormer/ChemBERTa on {self.device}...")
+            # Using ChemBERTa for efficiency; switch to 'ibm/MoLFormer-XL-75b' for max power
             model_name = "seyonec/ChemBERTa-zinc-base-v1" 
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            self.model = AutoModel.from_pretrained(model_name).to(device)
+            self.model = AutoModel.from_pretrained(model_name).to(self.device)
             self.model.eval()
-            self.embed_dim = 768 # Standard for Base Transformers
+            self.embed_dim = 768 
         else:
-            self.embed_dim = 1024 # Fallback to Morgan size
+            print("Transformers not installed. Using random fallback.")
+            self.embed_dim = 1024
 
-    def encode(self, smiles_list):
+    def encode(self, smiles_list: Any):
         """
         Batch encode SMILES strings.
-        Returns: Tensor (B, 768)
+        Returns: Tensor (B, 768) on the device the model is on.
         """
         if not TRANSFORMERS_AVAILABLE:
-            # Fallback to random noise if transformers missing
-            return torch.randn(len(smiles_list), self.embed_dim).to(self.device)
+            return torch.randn(len(smiles_list) if isinstance(smiles_list, list) else 1, self.embed_dim).to(self.device)
 
         if isinstance(smiles_list, str): 
             smiles_list = [smiles_list]
         
-        # Check cache to speed up training
-        uncached = [s for s in smiles_list if s not in self.cache]
-        
-        if uncached:
-            with torch.no_grad():
-                # Tokenize
-                inputs = self.tokenizer(uncached, return_tensors="pt", padding=True, truncation=True).to(self.device)
-                outputs = self.model(**inputs)
-                # Use CLS token (index 0) as the chemical summary
-                embeddings = outputs.last_hidden_state[:, 0, :]
-                
-                for s, emb in zip(uncached, embeddings):
-                    self.cache[s] = emb.cpu() # Store on CPU to save GPU RAM
-        
-        # Assemble batch
-        batch_emb = torch.stack([self.cache[s] for s in smiles_list]).to(self.device)
-        return batch_emb
+        with torch.no_grad():
+            # Tokenize and move to GPU
+            inputs = self.tokenizer(smiles_list, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            outputs = self.model(**inputs)
+            # Use CLS token as the chemical summary
+            embeddings = outputs.last_hidden_state[:, 0, :]
+            return embeddings
 
 class MorganFingerprintEncoder:
     """
@@ -477,16 +459,17 @@ class MorganFingerprintEncoder:
         
     def encode(self, smiles: Any) -> np.ndarray:
         """Encode SMILES string(s) to Morgan fingerprint."""
-        # NEW: Handle batch input (list of strings)
+        # 1. Handle batch input (list of strings)
         if isinstance(smiles, list):
-            # Just iterate and return as a numpy array
+            # Recursively call encode for each string in the list
             return np.array([self.encode(s) for s in smiles])
 
-        # Existing single-string logic
+        # 2. Single-string logic (with caching)
         if smiles in self.cache:
             return self.cache[smiles]
         
-        if RDKIT_AVAILABLE and smiles and smiles != 'DMSO' and smiles != 'CS(=O)C':
+        # Check for DMSO variants common in BBBC021 metadata
+        if RDKIT_AVAILABLE and smiles and smiles not in ['DMSO', 'CS(=O)C', 'None', '']:
             try:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol is not None:
@@ -499,8 +482,10 @@ class MorganFingerprintEncoder:
             except Exception as e:
                 print(f"Warning: Failed to encode SMILES '{smiles}': {e}")
         
-        # Fallback: use hash-based encoding for single string
+        # 3. Fallback: hash-based encoding for single string
+        # Ensure we don't already have it in cache from a previous fallback
         if smiles not in self.cache:
+            # Hash the string to seed the random generator for consistency
             np.random.seed(hash(str(smiles)) % (2**32))
             arr = np.random.rand(self.n_bits).astype(np.float32)
             arr = (arr > 0.5).astype(np.float32)
@@ -4956,6 +4941,8 @@ def main():
                        help="Use MoLFormer embeddings (768-dim) instead of Morgan fingerprints")
     parser.add_argument("--morgan-bits", type=int, default=1024,
                        help="Morgan fingerprint bit size (default: 1024)")
+    parser.add_argument("--perturbation-embed-dim", type=int, default=None,
+                       help="Perturbation embedding dimension (256 for Morgan, 768 for MoLFormer). Auto-set if not specified.")
     
     # Training
     parser.add_argument("--ddpm-epochs", type=int, default=500,
@@ -5046,6 +5033,7 @@ def main():
         follow_cellflux=args.follow_cellflux,
         use_morgan_fingerprints=args.use_morgan_fingerprints and not args.use_molformer,
         morgan_bits=args.morgan_bits,
+        perturbation_embed_dim=args.perturbation_embed_dim if args.perturbation_embed_dim is not None else (768 if args.use_molformer else 256),
         ddpm_epochs=args.ddpm_epochs,
         coupling_epochs=args.coupling_epochs,
         warmup_epochs=args.warmup_epochs,
