@@ -2019,9 +2019,9 @@ class ImageDDPM:
                 img_size=image_size,
                 in_channels=in_channels,
                 patch_size=4,
-                embed_dim=768,  # Default: 512 (scaled to 1024 if scale_up_uvit)
+                embed_dim=1024,  # Default: 512 (scaled to 1024 if scale_up_uvit)
                 depth=24,  # Default: 12 (scaled to 24 if scale_up_uvit)
-                num_heads=16 , # Default: 8 (scaled to 16 if scale_up_uvit)
+                num_heads=16,  # Default: 8 (scaled to 16 if scale_up_uvit)
                 cond_emb_dim=cond_emb_dim,
                 time_emb_dim=time_emb_dim
             ).to(self.device)
