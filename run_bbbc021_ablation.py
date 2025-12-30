@@ -2019,9 +2019,9 @@ class ImageDDPM:
                 img_size=image_size,
                 in_channels=in_channels,
                 patch_size=4,
-                embed_dim=512,  # Default: 512 (scaled to 1024 if scale_up_uvit)
-                depth=12,  # Default: 12 (scaled to 24 if scale_up_uvit)
-                num_heads=8,  # Default: 8 (scaled to 16 if scale_up_uvit)
+                embed_dim=768,  # Default: 512 (scaled to 1024 if scale_up_uvit)
+                depth=24,  # Default: 12 (scaled to 24 if scale_up_uvit)
+                num_heads=16 , # Default: 8 (scaled to 16 if scale_up_uvit)
                 cond_emb_dim=cond_emb_dim,
                 time_emb_dim=time_emb_dim
             ).to(self.device)
@@ -3404,7 +3404,7 @@ class BBBC021AblationRunner:
             gpu_stats = self._get_gpu_stats()
 
             # 2. Evaluate (Every 150 epochs)
-            if (epoch + 1) % 50 == 0:
+            if (epoch + 1) % 5 == 0:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
