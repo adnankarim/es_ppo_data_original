@@ -5077,6 +5077,10 @@ def main():
                        help="Use a larger Transformer backbone (Depth 24, Dim 1024) for GH200")
     parser.add_argument("--use-ema", action="store_true",
                        help="Enable Exponential Moving Average for smoother weights (Standard SOTA practice)")
+    # [FIX] Add this argument to handle the U-Net channel list
+    parser.add_argument("--unet-channels", type=int, nargs='+', 
+                        default=[128, 256, 512, 512],
+                        help="U-Net channel widths (provide list, e.g. 192 384 768 768)")
     
     # CFG Settings
     parser.add_argument("--cfg-dropout-prob", type=float, default=0.1,
@@ -5135,6 +5139,8 @@ def main():
         guidance_scale=args.guidance_scale,
         enable_bio_loss=args.enable_bio_loss,
         aux_device=args.aux_device,
+        # [FIX] Connect the argument to the config here:
+        unet_channels=args.unet_channels,
     )
     
     runner = BBBC021AblationRunner(config)
