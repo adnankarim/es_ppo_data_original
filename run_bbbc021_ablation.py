@@ -3499,11 +3499,12 @@ class BBBC021AblationRunner:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
+                kid_score = metrics.get('kid', 0.0)  # Extract KID
                 kl_score = metrics.get('kl_div_total', 0.0)
                 mi_score = metrics.get('mutual_information', 0.0)
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID ({num_samples_used}): {fid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KID: {kid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
                 # Update Best Metrics
                 if not self.config.follow_cellflux:
@@ -3559,6 +3560,7 @@ class BBBC021AblationRunner:
             # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
             metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
             fid_score = metrics.get('fid', 0.0)
+            kid_score = metrics.get('kid', 0.0)  # Extract KID
             kl_score = metrics.get('kl_div_total', 0.0)
             avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
             
@@ -3585,7 +3587,7 @@ class BBBC021AblationRunner:
             # Log all final metrics to wandb (including FID)
             self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=target_epoch)
             
-            print(f"  Final Epoch {target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KL: {kl_score:.4f}")
+            print(f"  Final Epoch {target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KID: {kid_score:.2f} | KL: {kl_score:.4f}")
             
         return ddpm, best_metrics
     
