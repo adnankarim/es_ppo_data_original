@@ -5198,7 +5198,7 @@ def main():
                        help="Skip loading optimizer state when resuming (use new learning rate)")
     
     # Data
-    parser.add_argument("--data-dir", type=str, default="~/bbbc021_all",
+    parser.add_argument("--data-dir", type=str, default="/home/jovyan/bbbc021_all",
                        help="Directory containing BBBC021 data")
     parser.add_argument("--metadata-file", type=str, default="metadata/bbbc021_df_all.csv",
                        help="Metadata CSV file")
