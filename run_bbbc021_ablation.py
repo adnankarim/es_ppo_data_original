@@ -2568,6 +2568,7 @@ class ImagePPOTrainer:
 class ImageMetrics:
     """
     [FIXED] Metrics suite matching CellFlux (ICML 2025) protocols.
+    - Optimized: Loads KID and FID models ONCE in __init__.
     - Fixes 'dtype=torch.uint8' crash by casting tensors before Inception.
     - Uses InceptionV3 features for MoA Accuracy (Deep Proxy).
     - Supports Conditional FID (per-compound).
@@ -2579,14 +2580,22 @@ class ImageMetrics:
         self.device = torch.device(device)
         self.inception = None
         self.fid_metric = None
+        self.kid_metric = None  # [NEW] Placeholder for KID
         if TORCHMETRICS_AVAILABLE:
             # Initialize InceptionV3 once to save memory
             from torchmetrics.image.fid import FrechetInceptionDistance
+            from torchmetrics.image.kid import KernelInceptionDistance
+            
+            # 1. Setup FID
             # normalize=True handles float inputs for the main .update() calls,
             # but the internal .inception network often expects uint8.
             self.fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(self.device)
             self.inception = self.fid_metric.inception
             self.inception.eval()
+            
+            # 2. Setup KID (Load ONCE) - Optimized to avoid re-initialization
+            # subset_size=100 is standard for KID stability
+            self.kid_metric = KernelInceptionDistance(subset_size=100, normalize=True).to(self.device)
 
     @torch.no_grad()
     def get_features(self, images: np.ndarray) -> torch.Tensor:
@@ -2657,27 +2666,34 @@ class ImageMetrics:
         tr_covmean = np.trace(covmean)
         return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
-    @staticmethod
     @torch.no_grad()
-    def compute_kid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda') -> float:
-        """Computes KID scaled by 1000 (Target: ~1.62)."""
-        if not TORCHMETRICS_AVAILABLE:
+    def compute_kid(self, real_images: np.ndarray, fake_images: np.ndarray) -> float:
+        """
+        Computes KID scaled by 1000 (Target: ~1.62).
+        Uses the pre-loaded metric from __init__ for efficiency.
+        """
+        if self.kid_metric is None:
             return 0.0
         
-        kid = KernelInceptionDistance(subset_size=100, normalize=True).to(device)
-        real_t = torch.tensor(real_images).float().to(device)
-        fake_t = torch.tensor(fake_images).float().to(device)
+        self.kid_metric.reset()  # Important: Clear previous batch stats
+        
+        # Convert to Tensor [0, 1] range on correct device
+        real_t = torch.tensor(real_images).float().to(self.device)
+        fake_t = torch.tensor(fake_images).float().to(self.device)
         
         # Normalize to [0, 1] for torchmetrics standard update
         if real_t.min() < 0:
             real_t = (real_t + 1.0) / 2.0
             fake_t = (fake_t + 1.0) / 2.0
             
-        # KID handles the uint8 conversion internally if normalize=True
-        kid.update(torch.clamp(real_t, 0, 1), real=True)
-        kid.update(torch.clamp(fake_t, 0, 1), real=False)
+        real_t = torch.clamp(real_t, 0, 1)
+        fake_t = torch.clamp(fake_t, 0, 1)
         
-        kid_mean, _ = kid.compute()
+        # Update metric
+        self.kid_metric.update(real_t, real=True)
+        self.kid_metric.update(fake_t, real=False)
+        
+        kid_mean, _ = self.kid_metric.compute()
         return float(kid_mean.item()) * 1000.0
 
     @staticmethod
@@ -3302,6 +3318,43 @@ class BBBC021AblationRunner:
             
         return stats
     
+    def _log_metrics_to_wandb(self, metrics: Dict, prefix: str = "", step: int = None):
+        """
+        Helper method to log all metrics to wandb.
+        Logs every metric in the dictionary with the given prefix.
+        
+        Args:
+            metrics: Dictionary of metrics to log
+            prefix: Prefix for metric names (e.g., "pretrain/", "PPO/config_0/")
+            step: Optional step number (epoch number)
+        """
+        if not self.config.use_wandb or not WANDB_AVAILABLE:
+            return
+        
+        log_dict = {}
+        for key, value in metrics.items():
+            # Skip non-numeric values and internal tracking fields
+            if key in ['history', 'phase', 'compound', 'moa_idx', 'batch', 'is_control', 'idx']:
+                continue
+            
+            # Convert to float if it's a tensor or numpy array
+            if isinstance(value, (torch.Tensor, np.ndarray)):
+                try:
+                    value = float(value.item() if hasattr(value, 'item') else float(value))
+                except:
+                    continue
+            
+            # Only log numeric values
+            if isinstance(value, (int, float)) and not (np.isnan(value) or np.isinf(value)):
+                metric_name = f"{prefix}{key}" if prefix else key
+                log_dict[metric_name] = value
+        
+        if log_dict:
+            if step is not None:
+                wandb.log(log_dict, step=step)
+            else:
+                wandb.log(log_dict)
+    
     def _pretrain_ddpm(self) -> Tuple[ImageDDPM, Dict]:
         """[FIXED] Conditional Marginal Pretraining with INCREMENTAL Logic."""
         # Determine model size based on flag
@@ -3432,6 +3485,9 @@ class BBBC021AblationRunner:
                 metrics['loss'] = avg_loss
                 metrics['phase'] = 'pretraining'
                 self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
+                
+                # Log all metrics to wandb (including FID)
+                self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=epoch + 1)
             else:
                 print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f}")
 
@@ -3462,6 +3518,9 @@ class BBBC021AblationRunner:
             metrics['loss'] = avg_loss
             metrics['phase'] = 'pretraining'
             self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
+            
+            # Log all final metrics to wandb (including FID)
+            self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=target_epoch)
             
             print(f"  Final Epoch {target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KL: {kl_score:.4f}")
             
@@ -3589,6 +3648,9 @@ class BBBC021AblationRunner:
                 metrics.update(gpu_stats)
                 warmup_metrics.append(metrics)
                 
+                # Log all warmup metrics to wandb (including FID)
+                self._log_metrics_to_wandb(metrics, prefix=f"ES/config_{config_idx}/warmup/", step=warmup_epoch + 1)
+                
                 # Plot during warmup
                 checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
                 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -3664,14 +3726,8 @@ class BBBC021AblationRunner:
 
                 print(f"    Epoch {epoch+1}: FID(All)={metrics['fid']:.2f} | FID(Cond)={fid_cond:.2f} | KID={kid:.2f} | MoA={moa*100:.1f}% | KL={kl:.4f} | MI={mi:.4f}")
             
-            # Log to wandb
-            if self.config.use_wandb and WANDB_AVAILABLE:
-                wandb.log({
-                    f'ES/config_{config_idx}/loss': avg_loss,
-                    f'ES/config_{config_idx}/fid': metrics['fid'],
-                    f'ES/config_{config_idx}/mse': metrics['mse'],
-                    f'ES/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
-                })
+            # Log all metrics to wandb (including FID, FID_conditional, KID, MoA, etc.)
+            self._log_metrics_to_wandb(metrics, prefix=f"ES/config_{config_idx}/", step=epoch + 1)
             
             self._save_checkpoint(cond_ddpm, None, epoch + 1, checkpoint_name)
         
@@ -3689,6 +3745,9 @@ class BBBC021AblationRunner:
         # Run NSCB benchmark
         nscb_results = self.run_nscb_benchmark(cond_ddpm)
         final_metrics.update(nscb_results)
+        
+        # Log NSCB metrics to wandb
+        self._log_metrics_to_wandb(nscb_results, prefix=f"ES/config_{config_idx}/nscb/")
         
         return final_metrics
     
@@ -3784,14 +3843,8 @@ class BBBC021AblationRunner:
 
                 print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID(All)={metrics['fid']:.2f} | FID(Cond)={fid_cond:.2f} | KID={kid:.2f} | MoA={moa*100:.1f}% | KL={kl:.4f} | MI={mi:.4f}")
             
-            # Log to wandb
-            if self.config.use_wandb and WANDB_AVAILABLE:
-                wandb.log({
-                    f'PPO/config_{config_idx}/loss': avg_loss,
-                    f'PPO/config_{config_idx}/fid': metrics['fid'],
-                    f'PPO/config_{config_idx}/mse': metrics['mse'],
-                    f'PPO/config_{config_idx}/gpu_max_mb': gpu_stats['gpu_mem_max_mb'],
-                })
+            # Log all metrics to wandb (including FID, FID_conditional, KID, MoA, etc.)
+            self._log_metrics_to_wandb(metrics, prefix=f"PPO/config_{config_idx}/", step=epoch + 1)
             
             # Save Checkpoint
             self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name)
@@ -3806,6 +3859,9 @@ class BBBC021AblationRunner:
         cond_ddpm.save(model_path)
         nscb_results = self.run_nscb_benchmark(cond_ddpm)
         final_metrics.update(nscb_results)
+        
+        # Log NSCB metrics to wandb
+        self._log_metrics_to_wandb(nscb_results, prefix=f"PPO/config_{config_idx}/nscb/")
         
         return final_metrics
     
@@ -3973,7 +4029,8 @@ class BBBC021AblationRunner:
         
         # A. Overall Metrics
         fid_overall = metrics_engine.compute_fid_from_features(real_feats, fake_feats)
-        kid_overall = ImageMetrics.compute_kid(real_imgs, fake_imgs, device=self.config.device)
+        # [UPDATED] Use the metrics_engine instance to reuse the loaded KID model
+        kid_overall = metrics_engine.compute_kid(real_imgs, fake_imgs)
         mse = ImageMetrics.compute_mse(real_imgs, fake_imgs)
         ssim = ImageMetrics.compute_ssim(real_imgs, fake_imgs)
         
@@ -4026,6 +4083,9 @@ class BBBC021AblationRunner:
             'num_eval_samples': len(real_imgs)
         }
         metrics.update(info_metrics)
+        
+        # Log all metrics to wandb
+        self._log_metrics_to_wandb(metrics, prefix="evaluation/")
         
         return metrics
     
@@ -4099,6 +4159,9 @@ class BBBC021AblationRunner:
         
         metrics = {'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim, 'num_eval_samples': actual_samples}
         metrics.update(info_metrics)
+        
+        # Log all metrics to wandb (including FID)
+        self._log_metrics_to_wandb(metrics, prefix="pretrain/evaluation/")
         
         return metrics
     
