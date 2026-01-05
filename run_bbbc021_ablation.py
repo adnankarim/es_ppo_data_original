@@ -3117,8 +3117,20 @@ class BBBC021AblationRunner:
                 # If it's some other error, raise it
                 raise e
 
-    def _save_checkpoint(self, model, optimizer, epoch, filename, is_global=False):
-        """Save checkpoint for model and optimizer."""
+    def _save_checkpoint(self, model, optimizer, epoch, filename, is_global=False, fid=None, method=None, config_idx=None):
+        """
+        Save checkpoint for model and optimizer.
+        
+        Args:
+            model: Model to save
+            optimizer: Optimizer to save
+            epoch: Current epoch
+            filename: Base filename
+            is_global: Whether to save to global directory
+            fid: Optional FID score to include in filename and state
+            method: Optional method name (Pretraining, ES, PPO) for organizing checkpoints
+            config_idx: Optional config index for organizing checkpoints
+        """
         state = {
             'epoch': epoch,
             'model_state_dict': model.model.state_dict(),
@@ -3126,9 +3138,29 @@ class BBBC021AblationRunner:
         }
         if model.perturbation_encoder:
             state['perturbation_encoder_state_dict'] = model.perturbation_encoder.state_dict()
-            
+        
+        # Add FID to state if provided
+        if fid is not None:
+            state['fid'] = fid
+        
         # Save to local run
         torch.save(state, os.path.join(self.models_dir, filename))
+        
+        # If FID is provided, also save with FID in filename for easy identification
+        if fid is not None:
+            # Create organized directory structure
+            if method:
+                checkpoint_subdir = os.path.join(self.models_dir, method)
+                if config_idx is not None:
+                    checkpoint_subdir = os.path.join(checkpoint_subdir, f"config_{config_idx}")
+                os.makedirs(checkpoint_subdir, exist_ok=True)
+                
+                # Save checkpoint with FID in filename
+                base_name = os.path.splitext(filename)[0]
+                fid_filename = f"{base_name}_epoch_{epoch:04d}_fid_{fid:.2f}.pt"
+                fid_path = os.path.join(checkpoint_subdir, fid_filename)
+                torch.save(state, fid_path)
+                print(f"  Saved FID checkpoint: {fid_path}")
         
         # Save to global if applicable
         if is_global:
@@ -3416,6 +3448,7 @@ class BBBC021AblationRunner:
         
         # Track best metrics
         best_metrics = {'fid': float('inf'), 'kl': 0.0, 'loss': 0.0, 'epoch': 0}
+        best_fid = float('inf')  # Track best FID for checkpoint naming
 
         if epochs_to_train <= 0:
             print(f"  [Incremental] Epochs set to {epochs_to_train}. Skipping training.")
@@ -3434,6 +3467,11 @@ class BBBC021AblationRunner:
             batch_size=self.config.ddpm_batch_size,
             shuffle=True
         )
+
+        # Track metrics for plotting
+        pretrain_metrics = []
+        checkpoint_dir = os.path.join(self.plots_dir, 'Pretraining')
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
         for epoch in range(start_epoch, target_epoch):
             # Reset peak memory stats at start of epoch
@@ -3472,19 +3510,33 @@ class BBBC021AblationRunner:
                     # SOTA BEATER MODE: Legitimate tuning on held-out Validation set
                     if fid_score < best_metrics['fid']:
                         best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
-                        # Save the 'best' for the next stage
-                        self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_best.pt", is_global=True)
+                        best_fid = fid_score
+                        # Save the 'best' checkpoint with FID
+                        self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_best.pt", 
+                                            is_global=True, fid=fid_score, method="Pretraining")
                 else:
                     # CELLFLUX REPRODUCTION MODE: Safe monitoring only
                     # We track the metrics, but best_metrics is ALWAYS the latest epoch
                     best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': epoch + 1}
                     # We do NOT save a 'best' checkpoint; we only use 'latest.pt'
+                
+                # Save checkpoint with FID whenever FID is calculated
+                self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, 
+                                    f"ddpm_pretrain_epoch_{epoch+1:04d}.pt", 
+                                    fid=fid_score, method="Pretraining")
 
                 # Save metrics to CSV
                 metrics['epoch'] = epoch + 1
                 metrics['loss'] = avg_loss
                 metrics['phase'] = 'pretraining'
+                metrics.update(gpu_stats)  # Add GPU stats
                 self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
+                
+                # Collect metrics for plotting
+                pretrain_metrics.append(metrics.copy())
+                
+                # Generate and save plot
+                self._plot_checkpoint(pretrain_metrics, checkpoint_dir, epoch, 'Pretraining', 'Pretraining')
                 
                 # Log all metrics to wandb (including FID)
                 self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=epoch + 1)
@@ -3513,11 +3565,22 @@ class BBBC021AblationRunner:
             # Update best_metrics with final epoch (for reporting)
             best_metrics = {'fid': fid_score, 'kl': kl_score, 'loss': avg_loss, 'epoch': target_epoch}
             
+            # Save final checkpoint with FID
+            self._save_checkpoint(ddpm, ddpm.optimizer, target_epoch, 
+                                f"ddpm_pretrain_epoch_{target_epoch:04d}.pt", 
+                                fid=fid_score, method="Pretraining")
+            
             # Save final metrics
             metrics['epoch'] = target_epoch
             metrics['loss'] = avg_loss
             metrics['phase'] = 'pretraining'
+            gpu_stats = self._get_gpu_stats()
+            metrics.update(gpu_stats)
             self._save_metrics_to_csv([metrics], self.plots_dir, 'Pretraining')
+            
+            # Add to metrics list and generate final plot
+            pretrain_metrics.append(metrics.copy())
+            self._plot_checkpoint(pretrain_metrics, checkpoint_dir, target_epoch - 1, 'Pretraining', 'Pretraining')
             
             # Log all final metrics to wandb (including FID)
             self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=target_epoch)
@@ -3651,6 +3714,12 @@ class BBBC021AblationRunner:
                 # Log all warmup metrics to wandb (including FID)
                 self._log_metrics_to_wandb(metrics, prefix=f"ES/config_{config_idx}/warmup/", step=warmup_epoch + 1)
                 
+                # Get FID score and save checkpoint
+                fid_score = metrics.get('fid', 0.0)
+                checkpoint_name = f'ES_config_{config_idx}_latest.pt'
+                self._save_checkpoint(cond_ddpm, None, warmup_epoch + 1, checkpoint_name,
+                                    fid=fid_score, method="ES", config_idx=config_idx)
+                
                 # Plot during warmup
                 checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
                 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -3658,10 +3727,6 @@ class BBBC021AblationRunner:
                 
                 if (warmup_epoch + 1) % 3 == 0:
                     print(f"      Warmup epoch {warmup_epoch+1}, Loss: {avg_loss:.4f}, FID: {metrics.get('fid', 0):.2f}")
-                
-                # Save checkpoint during warmup
-                current_epoch = warmup_epoch + 1
-                self._save_checkpoint(cond_ddpm, None, current_epoch, checkpoint_name)
         
         # Initialize epoch_metrics with warmup metrics
         epoch_metrics = warmup_metrics.copy()
@@ -3708,6 +3773,22 @@ class BBBC021AblationRunner:
             # Add GPU stats to metrics
             metrics.update(gpu_stats)
             epoch_metrics.append(metrics)
+            
+            # Get FID score
+            fid_score = metrics.get('fid', 0.0)
+            
+            # Track best FID and save best checkpoint
+            if fid_score < best_es_fid:
+                best_es_fid = fid_score
+                # Save best checkpoint
+                self._save_checkpoint(cond_ddpm, None, epoch + 1, 
+                                    f"ES_config_{config_idx}_best.pt", 
+                                    fid=fid_score, method="ES", config_idx=config_idx)
+                print(f"  New best FID: {fid_score:.2f} - Saved best checkpoint")
+            
+            # Save checkpoint with FID whenever FID is calculated
+            self._save_checkpoint(cond_ddpm, None, epoch + 1, checkpoint_name,
+                                fid=fid_score, method="ES", config_idx=config_idx)
             
             # Plot checkpoint
             checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
@@ -3794,6 +3875,9 @@ class BBBC021AblationRunner:
         
         epoch_metrics = []
         
+        # Track best FID for PPO
+        best_ppo_fid = float('inf')
+        
         for epoch in range(start_epoch, target_epoch):
             # Reset peak memory stats at start of epoch
             if torch.cuda.is_available():
@@ -3825,6 +3909,22 @@ class BBBC021AblationRunner:
             # Add GPU stats to metrics
             metrics.update(gpu_stats)
             epoch_metrics.append(metrics)
+            
+            # Get FID score
+            fid_score = metrics.get('fid', 0.0)
+            
+            # Track best FID and save best checkpoint
+            if fid_score < best_ppo_fid:
+                best_ppo_fid = fid_score
+                # Save best checkpoint
+                self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, 
+                                    f"PPO_config_{config_idx}_best.pt", 
+                                    fid=fid_score, method="PPO", config_idx=config_idx)
+                print(f"  New best FID: {fid_score:.2f} - Saved best checkpoint")
+            
+            # Save checkpoint with FID whenever FID is calculated
+            self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name,
+                                fid=fid_score, method="PPO", config_idx=config_idx)
             
             # Plot checkpoint
             checkpoint_dir = os.path.join(self.plots_dir, f'PPO_config_{config_idx}')
@@ -4585,9 +4685,28 @@ Learned Statistics:
         fig.suptitle(f'{method} Training Progress - {config_str}', 
                      fontsize=14, fontweight='bold', y=0.995)
         
-        # Save plot
+        # Save plot locally
         plot_path = os.path.join(checkpoint_dir, f'{method}_epoch_{epoch+1:04d}.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        
+        # Log plot to wandb
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            try:
+                import wandb
+                # Determine wandb key based on method and config
+                if method == 'Pretraining':
+                    wandb_key = f"pretrain/plots/checkpoint"
+                elif 'config' in checkpoint_dir:
+                    # Extract config index from checkpoint_dir (e.g., "ES_config_0" -> "0")
+                    config_idx = checkpoint_dir.split('config_')[-1].split('/')[0] if 'config_' in checkpoint_dir else "0"
+                    wandb_key = f"{method}/config_{config_idx}/plots/checkpoint"
+                else:
+                    wandb_key = f"{method}/plots/checkpoint"
+                
+                wandb.log({wandb_key: wandb.Image(plot_path)}, step=epoch + 1)
+            except Exception as e:
+                print(f"Warning: Failed to log plot to wandb: {e}")
+        
         plt.close()
         
         # Also save latest plot with fixed name for easy access
@@ -4952,11 +5071,21 @@ Learned Statistics:
         
         plt.tight_layout()
         
-        # Save
+        # Save locally
         checkpoint_dir = os.path.join(self.plots_dir, f'{method}_config_{config_idx}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         plot_path = os.path.join(checkpoint_dir, 'latent_space.png')
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        
+        # Log to wandb
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            try:
+                import wandb
+                wandb_key = f"{method}/config_{config_idx}/plots/latent_space"
+                wandb.log({wandb_key: wandb.Image(plot_path)})
+            except Exception as e:
+                print(f"Warning: Failed to log latent space plot to wandb: {e}")
+        
         plt.close()
         
         print(f"  Latent space visualization saved to: {plot_path}")
@@ -5023,6 +5152,16 @@ Learned Statistics:
             
         save_path = os.path.join(self.plots_dir, f"interp_{start_compound}_to_{end_compound}.png")
         plt.savefig(save_path)
+        
+        # Log to wandb
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            try:
+                import wandb
+                wandb_key = f"plots/interpolation_{start_compound}_to_{end_compound}"
+                wandb.log({wandb_key: wandb.Image(save_path)})
+            except Exception as e:
+                print(f"Warning: Failed to log interpolation plot to wandb: {e}")
+        
         plt.close()
         print(f"Interpolation saved to {save_path}")
 
