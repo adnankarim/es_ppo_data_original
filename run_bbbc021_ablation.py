@@ -2697,20 +2697,35 @@ class ImageMetrics:
         return float(kid_mean.item()) * 1000.0
 
     @staticmethod
-    def compute_deep_moa_accuracy(real_features: np.ndarray, fake_features: np.ndarray, labels: np.ndarray) -> float:
+    def compute_deep_moa_accuracy(real_features: Any, fake_features: Any, labels: np.ndarray) -> float:
         """
         1-NN Accuracy using Deep Inception Features.
+        Auto-converts CUDA tensors to CPU numpy arrays.
         """
         if not SKLEARN_AVAILABLE or len(labels) == 0:
             return 0.0
         
-        knn = KNeighborsClassifier(n_neighbors=1, metric='cosine')
-        # Train on Real
-        knn.fit(real_features, labels)
-        # Test on Fake
-        preds = knn.predict(fake_features)
-        
-        return float(np.mean(preds == labels))
+        # [FIX] Safe conversion from Tensor (GPU/CPU) to Numpy
+        if isinstance(real_features, torch.Tensor):
+            real_features = real_features.cpu().numpy()
+        if isinstance(fake_features, torch.Tensor):
+            fake_features = fake_features.cpu().numpy()
+            
+        # Ensure labels are numpy
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+
+        try:
+            knn = KNeighborsClassifier(n_neighbors=1, metric='cosine')
+            # Train on Real
+            knn.fit(real_features, labels)
+            # Test on Fake
+            preds = knn.predict(fake_features)
+            
+            return float(np.mean(preds == labels))
+        except Exception as e:
+            print(f"Warning: MoA Accuracy calculation failed: {e}")
+            return 0.0
 
     @staticmethod
     def compute_pixel_change(real_controls: np.ndarray, fake_perturbed: np.ndarray) -> float:
@@ -4027,9 +4042,10 @@ class BBBC021AblationRunner:
         # 3. Compute Deep MoA Accuracy
         moa_acc = 0.0
         if SKLEARN_AVAILABLE and len(moas) > 0 and real_feats is not None:
+            # [FIX] Added .cpu() before .numpy() to handle GPU tensors
             moa_acc = metrics_engine.compute_deep_moa_accuracy(
-                real_feats.numpy(), 
-                fake_feats.numpy(), 
+                real_feats.cpu().numpy(), 
+                fake_feats.cpu().numpy(), 
                 moas
             )
             
@@ -4164,9 +4180,10 @@ class BBBC021AblationRunner:
         # C. Deep MoA Accuracy (Using Inception Features)
         moa_acc = 0.0
         if SKLEARN_AVAILABLE and len(moas) > 0:
+            # [FIX] Added .cpu() before .numpy() to handle GPU tensors
             moa_acc = ImageMetrics.compute_deep_moa_accuracy(
-                real_feats.numpy(), 
-                fake_feats.numpy(), 
+                real_feats.cpu().numpy(), 
+                fake_feats.cpu().numpy(), 
                 moas
             )
         
@@ -4898,8 +4915,11 @@ Learned Statistics:
         
         # Compute MoA Accuracy using biological features
         if SKLEARN_AVAILABLE and len(moa_labels) > 0:
-            moa_accuracy = ImageMetrics.compute_moa_accuracy(
-                real_feats, fake_feats, np.array(moa_labels)
+            # [FIX] Ensure inputs are numpy arrays (ApproximateMetrics returns numpy, but just in case)
+            moa_accuracy = ImageMetrics.compute_deep_moa_accuracy(
+                real_feats, 
+                fake_feats, 
+                np.array(moa_labels)
             )
             print(f"NSCB MoA Accuracy: {moa_accuracy*100:.2f}%")
         else:
