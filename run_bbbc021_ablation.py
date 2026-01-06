@@ -2288,7 +2288,8 @@ class ImageDDPM:
     
     def load(self, path: str):
         """Load model."""
-        checkpoint = torch.load(path, map_location=self.device)
+        # [FIX] Added weights_only=False to support numpy scalars in checkpoints (PyTorch 2.6+)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if self.perturbation_encoder is not None and 'perturbation_encoder_state_dict' in checkpoint:
@@ -3104,7 +3105,8 @@ class BBBC021AblationRunner:
 
         print(f"Loading checkpoint: {path}")
         try:
-            ckpt = torch.load(path, map_location=self.config.device)
+            # [FIX] Added weights_only=False to support numpy scalars in checkpoints (PyTorch 2.6+)
+            ckpt = torch.load(path, map_location=self.config.device, weights_only=False)
             
             # 2. Attempt to load weights
             # strict=True ensures we catch mismatches immediately
