@@ -844,8 +844,15 @@ class BBBC021Dataset(Dataset):
                 smiles = meta.get('smiles', '')
                 if not smiles: 
                     smiles = 'DMSO'  # Fallback
-                # Returns (768,) tensor, convert to numpy for compatibility
-                embedding = self.chem_encoder.encode([smiles]).squeeze(0).cpu().numpy()
+                # Encode and convert to numpy (handles both tensor and numpy outputs)
+                embedding_result = self.chem_encoder.encode([smiles])
+                if isinstance(embedding_result, torch.Tensor):
+                    embedding = embedding_result.squeeze(0).cpu().numpy()
+                elif isinstance(embedding_result, np.ndarray):
+                    embedding = embedding_result.squeeze(0) if embedding_result.ndim > 1 else embedding_result
+                else:
+                    # Fallback: try to convert to numpy
+                    embedding = np.array(embedding_result).squeeze(0) if hasattr(embedding_result, 'squeeze') else np.array(embedding_result)
                 self.fingerprints[compound] = embedding
     
     def __len__(self) -> int:
