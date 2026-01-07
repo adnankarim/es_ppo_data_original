@@ -5233,30 +5233,25 @@ Learned Statistics:
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
-        # CRITICAL FIX: Verify correct encoder type (not just None check)
-        # The chem_encoder encodes SMILES to fingerprints, PerturbationEncoder encodes fingerprints to embeddings
-        # This catches cases where wrong object was assigned (e.g., if chem_encoder was mistakenly used)
-        if not isinstance(model.perturbation_encoder, PerturbationEncoder):
-            print("  [Fix] Re-initializing PerturbationEncoder MLP...")
-            model.perturbation_encoder = PerturbationEncoder(
-                input_dim=self.fingerprint_dim,
-                output_dim=self.config.perturbation_embed_dim
-            ).to(self.config.device)
-
         # 2. Load Weights (handles all checkpoint formats)
         print(f"Loading weights from {self.config.checkpoint_path}...")
         checkpoint = torch.load(self.config.checkpoint_path, map_location=self.config.device, weights_only=False)
-        
+
         # Handle different checkpoint formats
         # Format 1: Standard format from _save_checkpoint (used by pretrain, ES, PPO)
         if 'model_state_dict' in checkpoint:
             model.model.load_state_dict(checkpoint['model_state_dict'])
-            if 'perturbation_encoder_state_dict' in checkpoint and model.perturbation_encoder:
+            if 'perturbation_encoder_state_dict' in checkpoint:
                 try:
                     model.perturbation_encoder.load_state_dict(checkpoint['perturbation_encoder_state_dict'])
                 except Exception as e:
                     print(f"Warning: Could not load perturbation encoder from checkpoint: {e}")
-                    print("  Using current encoder (may not match checkpoint)")
+                    print("  Re-initializing PerturbationEncoder with fresh weights...")
+                    # Always reinitialize if load fails
+                    model.perturbation_encoder = PerturbationEncoder(
+                        input_dim=self.fingerprint_dim,
+                        output_dim=self.config.perturbation_embed_dim
+                    ).to(self.config.device)
             
             # Print checkpoint metadata if available
             if 'epoch' in checkpoint:
@@ -5268,7 +5263,18 @@ Learned Statistics:
             # This format stores state_dict directly
             raise ValueError(f"Unsupported checkpoint format. Expected 'model_state_dict' key. "
                            f"Found keys: {list(checkpoint.keys())}")
-        
+
+        # CRITICAL POST-LOAD VERIFICATION: Ensure encoder is correct type
+        # This catches cases where checkpoint contains wrong encoder object (e.g., MoLFormerEncoder)
+        if not isinstance(model.perturbation_encoder, PerturbationEncoder):
+            print(f"  [CRITICAL FIX] Found wrong encoder type: {type(model.perturbation_encoder)}")
+            print("  Re-initializing PerturbationEncoder with correct type...")
+            model.perturbation_encoder = PerturbationEncoder(
+                input_dim=self.fingerprint_dim,
+                output_dim=self.config.perturbation_embed_dim
+            ).to(self.config.device)
+            print("  [SUCCESS] PerturbationEncoder is now correct type")
+
         model.model.eval()
 
         # 3. Setup Metrics Engine
