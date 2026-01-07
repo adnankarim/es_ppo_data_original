@@ -317,6 +317,10 @@ class BBBC021Config:
     # Evaluation
     num_eval_samples: int = 1000
     fid_batch_size: int = 64
+    # Evaluation Mode
+    eval_samples: int = 5000
+    checkpoint_path: Optional[str] = None
+    eval_batch_size: int = 64
     
     # Memory optimization
     gradient_checkpointing: bool = True
@@ -3195,9 +3199,16 @@ class BBBC021AblationRunner:
         print("\n" + "=" * 80)
         if self.config.mode == "ablation":
             print("BBBC021 ABLATION STUDY: ES vs PPO")
+        elif self.config.mode == "evaluate":
+            print("BBBC021 EVALUATION MODE: Benchmarking Checkpoint")
         else:
             print(f"BBBC021 SINGLE EXPERIMENT: {self.config.method}")
         print("=" * 80 + "\n")
+        
+        # [NEW] Dispatch Evaluation Mode
+        if self.config.mode == "evaluate":
+            self.run_evaluation_mode()
+            return
         
         start_time = time.time()
         
@@ -5124,6 +5135,168 @@ Learned Statistics:
         
         print(f"  Latent space visualization saved to: {plot_path}")
 
+    def run_evaluation_mode(self):
+        """
+        Dedicated evaluation mode for benchmarking a specific checkpoint.
+        Runs: FID, Conditional FID, KID (Scaled), Deep MoA Accuracy, and NSCB.
+        """
+        print("\n" + "=" * 80)
+        print(f"EVALUATION MODE: Benchmarking {self.config.checkpoint_path}")
+        print(f"Target Samples: {self.config.eval_samples}")
+        print("=" * 80 + "\n")
+
+        if not self.config.checkpoint_path or not os.path.exists(self.config.checkpoint_path):
+            raise ValueError(f"Checkpoint not found: {self.config.checkpoint_path}")
+
+        # 1. Initialize Model Architecture
+        # Create model directly (no need for pretrained model transfer in eval mode)
+        model = ImageDDPM(
+            image_size=self.config.image_size,
+            in_channels=self.config.num_channels,
+            channels=self.config.unet_channels,
+            timesteps=self.config.ddpm_timesteps,
+            time_emb_dim=self.config.time_embed_dim,
+            lr=self.config.ddpm_lr,
+            device=self.config.device,
+            conditional=True,
+            cond_emb_dim=self.config.perturbation_embed_dim,
+            fingerprint_input_dim=self.fingerprint_dim,
+            use_transformer=self.config.use_transformer,
+            cfg_dropout_prob=self.config.cfg_dropout_prob,
+        )
+        
+        # Initialize perturbation encoder (will be loaded from checkpoint if available)
+        model.perturbation_encoder = self.chem_encoder
+
+        # 2. Load Weights
+        print(f"Loading weights from {self.config.checkpoint_path}...")
+        checkpoint = torch.load(self.config.checkpoint_path, map_location=self.config.device, weights_only=False)
+        model.model.load_state_dict(checkpoint['model_state_dict'])
+        if 'perturbation_encoder_state_dict' in checkpoint and model.perturbation_encoder:
+            model.perturbation_encoder.load_state_dict(checkpoint['perturbation_encoder_state_dict'])
+        model.model.eval()
+
+        # 3. Setup Metrics Engine
+        metrics_engine = ImageMetrics(device=self.config.aux_device)
+
+        # 4. Generate Data (Using Validation/Test Set)
+        # Use Test set for final paper numbers, Validation for tuning
+        target_dataset = self.test_dataset if self.config.follow_cellflux else self.val_dataset
+        print(f"Evaluating on {len(target_dataset)} real samples from {self.config.mode} split...")
+        
+        # Use appropriate loader based on follow_cellflux
+        if self.config.follow_cellflux:
+            val_loader = BatchPairedDataLoaderCellFlux(
+                target_dataset, 
+                batch_size=self.config.eval_batch_size, 
+                shuffle=False
+            )
+        else:
+            val_loader = BatchPairedDataLoader(
+                target_dataset, 
+                batch_size=self.config.eval_batch_size, 
+                shuffle=False
+            )
+
+        all_real, all_fake = [], []
+        all_compounds, all_moas = [], []
+        num_samples = 0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if num_samples >= self.config.eval_samples: 
+                    break
+                
+                control = batch['control'].to(self.config.device)
+                fingerprint = batch['fingerprint'].to(self.config.device)
+                
+                # Generate
+                gen = model.sample(len(control), control, fingerprint, 
+                                 num_steps=self.config.num_sampling_steps, 
+                                 guidance_scale=self.config.guidance_scale)
+                
+                # Store
+                all_real.append(batch['perturbed'].cpu().numpy())
+                all_fake.append(gen.cpu().numpy())
+                
+                if 'compound' in batch: 
+                    all_compounds.extend(batch['compound'])
+                if 'moa_idx' in batch: 
+                    all_moas.extend(batch['moa_idx'].cpu().tolist() if torch.is_tensor(batch['moa_idx']) else batch['moa_idx'])
+                
+                num_samples += len(control)
+                print(f"  Generated {num_samples}/{self.config.eval_samples}...", end='\r')
+
+        # Concat
+        real_imgs = np.concatenate(all_real, axis=0)[:self.config.eval_samples]
+        fake_imgs = np.concatenate(all_fake, axis=0)[:self.config.eval_samples]
+        compounds = np.array(all_compounds[:self.config.eval_samples]) if all_compounds else np.array([])
+        moas = np.array(all_moas[:self.config.eval_samples]) if all_moas else np.array([])
+
+        # 5. Compute Metrics
+        print("\nComputing Inception Features...")
+        real_feats = metrics_engine.get_features(real_imgs)
+        fake_feats = metrics_engine.get_features(fake_imgs)
+
+        print("Computing FID...")
+        fid_all = metrics_engine.compute_fid_from_features(real_feats, fake_feats)
+        
+        print("Computing KID...")
+        kid_score = metrics_engine.compute_kid(real_imgs, fake_imgs)  # Already scaled x1000 in your class
+
+        print("Computing Conditional FID...")
+        fids_c = []
+        if len(compounds) > 0:
+            unique_cmps = np.unique(compounds)
+            for cmp in unique_cmps:
+                idxs = np.where(compounds == cmp)[0]
+                if len(idxs) >= 5:  # Threshold for stability
+                    r_sub = real_feats[idxs]
+                    f_sub = fake_feats[idxs]
+                    try:
+                        fids_c.append(metrics_engine.compute_fid_from_features(r_sub, f_sub))
+                    except: 
+                        pass
+        fid_cond = np.mean(fids_c) if fids_c else 0.0
+
+        print("Computing Deep MoA Accuracy...")
+        moa_acc = 0.0
+        if SKLEARN_AVAILABLE and len(moas) > 0:
+            moa_acc = metrics_engine.compute_deep_moa_accuracy(
+                real_feats.cpu().numpy(), fake_feats.cpu().numpy(), moas
+            )
+
+        # 6. Run NSCB (Hold-out Batch Generalization)
+        print("Running NSCB Benchmark...")
+        nscb_metrics = self.run_nscb_benchmark(model)
+
+        # 7. Final Report
+        print("\n" + "="*40)
+        print("FINAL BENCHMARK RESULTS")
+        print("="*40)
+        print(f"FID (All):       {fid_all:.2f}")
+        print(f"FID (Cond):      {fid_cond:.2f}")
+        print(f"KID (x1000):     {kid_score:.2f}")
+        print(f"MoA Accuracy:    {moa_acc*100:.2f}%")
+        print(f"NSCB Profile:    {nscb_metrics.get('nscb_profile_similarity', 0):.4f}")
+        print(f"NSCB MoA:        {nscb_metrics.get('nscb_moa_accuracy', 0)*100:.2f}%")
+        print("="*40)
+
+        # Save to file
+        results = {
+            "checkpoint": self.config.checkpoint_path,
+            "fid_all": fid_all,
+            "fid_cond": fid_cond,
+            "kid": kid_score,
+            "moa_accuracy": moa_acc,
+            "nscb_profile": nscb_metrics.get('nscb_profile_similarity', 0),
+            "nscb_moa": nscb_metrics.get('nscb_moa_accuracy', 0)
+        }
+        res_path = os.path.join(self.output_dir, "final_benchmark_results.json")
+        with open(res_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Results saved to {res_path}")
+
     def generate_interpolation(self, model, start_compound='DMSO', end_compound='Taxol', steps=8):
         """
         Generates a latent interpolation video/plot between two compounds.
@@ -5216,8 +5389,8 @@ def main():
     )
     
     # Mode Selection
-    parser.add_argument("--mode", type=str, default="ablation", choices=["ablation", "single"],
-                       help="Run mode: 'ablation' (loop through params) or 'single' (one config)")
+    parser.add_argument("--mode", type=str, default="ablation", choices=["ablation", "single", "evaluate"],
+                       help="Run mode: 'ablation' (loop through params), 'single' (one config), or 'evaluate' (benchmark checkpoint)")
     parser.add_argument("--method", type=str, default="PPO", choices=["PPO", "ES"],
                        help="Training method (for single mode)")
     parser.add_argument("--resume-id", type=str, default=None,
@@ -5332,6 +5505,14 @@ def main():
     parser.add_argument("--aux-device", type=str, default="cuda",
                        help="Device for aux models (Metrics, DINO, Encoders). Use 'cpu' to save VRAM.")
     
+    # Evaluation Mode Arguments
+    parser.add_argument("--eval-samples", type=int, default=5000,
+                        help="Number of samples to generate for evaluation mode (default: 5000)")
+    parser.add_argument("--checkpoint-path", type=str, default=None,
+                        help="Path to specific model checkpoint (.pt) to evaluate")
+    parser.add_argument("--eval-batch-size", type=int, default=64,
+                        help="Batch size for evaluation generation")
+    
     args = parser.parse_args()
     
     config = BBBC021Config(
@@ -5378,6 +5559,11 @@ def main():
         # [FIX] Connect the argument to the config here:
         unet_channels=args.unet_channels,
     )
+    
+    # Patch config with eval args
+    config.eval_samples = args.eval_samples
+    config.checkpoint_path = args.checkpoint_path
+    config.eval_batch_size = args.eval_batch_size
     
     runner = BBBC021AblationRunner(config)
     runner.run()
