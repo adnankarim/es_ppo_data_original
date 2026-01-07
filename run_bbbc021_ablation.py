@@ -3757,6 +3757,9 @@ class BBBC021AblationRunner:
         # Initialize epoch_metrics with warmup metrics
         epoch_metrics = warmup_metrics.copy()
         
+        # Track best FID for ES (initialize before training loop)
+        best_es_fid = float('inf')
+        
         # ES training
         es_trainer = ImageESTrainer(
             cond_ddpm,
