@@ -5149,14 +5149,14 @@ Learned Statistics:
         if not self.config.checkpoint_path or not os.path.exists(self.config.checkpoint_path):
             raise ValueError(f"Checkpoint not found: {self.config.checkpoint_path}")
 
-        # Detect checkpoint type from filename
+        # Detect checkpoint type from filename (check PPO before ES to avoid false matches)
         checkpoint_name = os.path.basename(self.config.checkpoint_path)
         if 'ddpm_pretrain' in checkpoint_name or 'pretrain' in checkpoint_name.lower():
             checkpoint_type = "Pretrained DDPM"
+        elif 'PPO_config' in checkpoint_name or ('ppo' in checkpoint_name.lower() and 'es' not in checkpoint_name.lower()):
+            checkpoint_type = "PPO (Proximal Policy Optimization)"
         elif 'ES_config' in checkpoint_name or 'es' in checkpoint_name.lower():
             checkpoint_type = "ES (Evolution Strategies)"
-        elif 'PPO_config' in checkpoint_name or 'ppo' in checkpoint_name.lower():
-            checkpoint_type = "PPO (Proximal Policy Optimization)"
         else:
             checkpoint_type = "Unknown (Generic DDPM)"
         print(f"Detected checkpoint type: {checkpoint_type}")
@@ -5178,8 +5178,14 @@ Learned Statistics:
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
-        # Initialize perturbation encoder (will be loaded from checkpoint if available)
-        model.perturbation_encoder = self.chem_encoder
+        # Initialize perturbation encoder properly (PerturbationEncoder, not chem_encoder)
+        # The chem_encoder encodes SMILES to fingerprints, PerturbationEncoder encodes fingerprints to embeddings
+        # Note: ImageDDPM.__init__ already creates this, but we need to ensure it exists
+        if model.perturbation_encoder is None:
+            model.perturbation_encoder = PerturbationEncoder(
+                input_dim=self.fingerprint_dim,
+                output_dim=self.config.perturbation_embed_dim
+            ).to(self.config.device)
 
         # 2. Load Weights (handles all checkpoint formats)
         print(f"Loading weights from {self.config.checkpoint_path}...")
@@ -5212,10 +5218,10 @@ Learned Statistics:
         # 3. Setup Metrics Engine
         metrics_engine = ImageMetrics(device=self.config.aux_device)
 
-        # 4. Generate Data (Using Validation/Test Set)
-        # Use Test set for final paper numbers, Validation for tuning
-        target_dataset = self.test_dataset if self.config.follow_cellflux else self.val_dataset
-        print(f"Evaluating on {len(target_dataset)} real samples from {self.config.mode} split...")
+        # 4. Generate Data (Using Test Set for final evaluation)
+        # Always use test set for evaluation mode to get final paper numbers
+        target_dataset = self.test_dataset
+        print(f"Evaluating on {len(target_dataset)} real samples from TEST split...")
         
         # Use appropriate loader based on follow_cellflux
         if self.config.follow_cellflux:

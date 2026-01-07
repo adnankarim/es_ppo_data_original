@@ -1,0 +1,1 @@
+python3 run_bbbc021_ablation.py   --mode single   --method PPO   --aux-device cuda   --ddpm-epochs 500   --ddpm-lr 1e-4   --ddpm-batch-size 256   --coupling-batch-size 256   --unet-channels 192 384 768 768   --use-molformer   --perturbation-embed-dim 768   --enable-bio-loss   --use-wandb   --force-pretrain   --cfg-dropout-prob 0.1   --guidance-scale 4.0   --use-ema
