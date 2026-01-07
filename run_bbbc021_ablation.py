@@ -2740,9 +2740,50 @@ class ImageMetrics:
             return 0.0
 
     @staticmethod
+    def compute_deep_moa_metrics(real_features: Any, fake_features: Any, labels: np.ndarray) -> Dict[str, float]:
+        """
+        Computes 1-NN Accuracy AND F1 Scores (Macro/Weighted) using Deep Features.
+        Returns all three MoA evaluation metrics for Table 6 replication.
+        """
+        if not SKLEARN_AVAILABLE or len(labels) == 0:
+            return {'acc': 0.0, 'f1_macro': 0.0, 'f1_weighted': 0.0}
+
+        from sklearn.metrics import f1_score, accuracy_score
+
+        # Safe conversion from Tensor to Numpy
+        if isinstance(real_features, torch.Tensor):
+            real_features = real_features.cpu().numpy()
+        if isinstance(fake_features, torch.Tensor):
+            fake_features = fake_features.cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+
+        try:
+            # 1-NN Classifier (Cosine Similarity)
+            knn = KNeighborsClassifier(n_neighbors=1, metric='cosine')
+            knn.fit(real_features, labels)
+
+            # Predict on generated samples
+            preds = knn.predict(fake_features)
+
+            # Calculate Metrics
+            acc = accuracy_score(labels, preds)
+            f1_macro = f1_score(labels, preds, average='macro', zero_division=0)
+            f1_weighted = f1_score(labels, preds, average='weighted', zero_division=0)
+
+            return {
+                'acc': float(acc),
+                'f1_macro': float(f1_macro),
+                'f1_weighted': float(f1_weighted)
+            }
+        except Exception as e:
+            print(f"Warning: MoA Metric calculation failed: {e}")
+            return {'acc': 0.0, 'f1_macro': 0.0, 'f1_weighted': 0.0}
+
+    @staticmethod
     def compute_pixel_change(real_controls: np.ndarray, fake_perturbed: np.ndarray) -> float:
         """
-        Calculates L1 Pixel Difference. 
+        Calculates L1 Pixel Difference.
         Detects 'Lazy Models' that just output the input image.
         Target: > 0.02 (Small change) but < 0.2 (Total destruction).
         """
@@ -4175,30 +4216,43 @@ class BBBC021AblationRunner:
         mse = ImageMetrics.compute_mse(real_imgs, fake_imgs)
         ssim = ImageMetrics.compute_ssim(real_imgs, fake_imgs)
         
-        # B. Conditional FID (FID_c) - The CellFlux Benchmark
+        # B. Conditional Metrics (FID_c and KID_c) - Per-Compound Average
         fid_conditional = 0.0
+        kid_conditional = 0.0
         if len(compounds) > 0 and len(np.unique(compounds)) > 1:
             unique_cmps = np.unique(compounds)
             fids_c = []
+            kids_c = []
             for cmp in unique_cmps:
                 # Get indices for this compound
                 idxs = np.where(compounds == cmp)[0]
-                if len(idxs) < 5: 
-                    continue  # Need minimum samples for stats
-                
-                # Compute FID just for this slice using pre-computed features
+                if len(idxs) < 8:
+                    continue  # Need minimum samples for stable stats (8 vs 10 for speed)
+
+                # Compute FID using pre-computed features
                 r_sub = real_feats[idxs]
                 f_sub = fake_feats[idxs]
+                r_img_sub = real_imgs[idxs]
+                f_img_sub = fake_imgs[idxs]
+
                 try:
                     fid_val = metrics_engine.compute_fid_from_features(r_sub, f_sub)
                     fids_c.append(fid_val)
-                except Exception as e:
+                except Exception:
                     # Skip compounds that fail (e.g., too few samples for covariance)
                     pass
-            
+
+                # Compute KID (more robust than FID for small N)
+                try:
+                    kid_val = metrics_engine.compute_kid(r_img_sub, f_img_sub)
+                    kids_c.append(kid_val)
+                except Exception:
+                    pass
+
             fid_conditional = np.mean(fids_c) if fids_c else 0.0
+            kid_conditional = np.mean(kids_c) if kids_c else 0.0
             if len(fids_c) > 0:
-                print(f"    Conditional FID: {fid_conditional:.2f} (avg over {len(fids_c)} compounds)")
+                print(f"    Conditional mFID: {fid_conditional:.2f} | mKID: {kid_conditional:.2f} (avg over {len(fids_c)} compounds)")
         
         # C. Deep MoA Accuracy (Using Inception Features)
         moa_acc = 0.0
@@ -4215,10 +4269,11 @@ class BBBC021AblationRunner:
         info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
 
         metrics = {
-            'fid': fid_overall,                    # Overall FID (Target: 18.7)
-            'fid_conditional': fid_conditional,     # Conditional FID (Target: 56.8) <--- COMPARE THIS
-            'kid': kid_overall,                    # KID (Target: 1.62)
-            'moa_accuracy': moa_acc,               # MoA Accuracy (Target: > 70%) <--- COMPARE THIS
+            'fid': fid_overall,                    # Overall FID (Global quality)
+            'fid_conditional': fid_conditional,    # Conditional mFID (Per-compound consistency)
+            'kid': kid_overall,                    # Overall KID (Global unbiased)
+            'kid_conditional': kid_conditional,    # Conditional mKID (Per-compound unbiased)
+            'moa_accuracy': moa_acc,               # Deep MoA Accuracy
             'pixel_change': pixel_change,
             'mse': mse,
             'ssim': ssim,
@@ -5178,10 +5233,11 @@ Learned Statistics:
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
-        # Initialize perturbation encoder properly (PerturbationEncoder, not chem_encoder)
+        # CRITICAL FIX: Verify correct encoder type (not just None check)
         # The chem_encoder encodes SMILES to fingerprints, PerturbationEncoder encodes fingerprints to embeddings
-        # Note: ImageDDPM.__init__ already creates this, but we need to ensure it exists
-        if model.perturbation_encoder is None:
+        # This catches cases where wrong object was assigned (e.g., if chem_encoder was mistakenly used)
+        if not isinstance(model.perturbation_encoder, PerturbationEncoder):
+            print("  [Fix] Re-initializing PerturbationEncoder MLP...")
             model.perturbation_encoder = PerturbationEncoder(
                 input_dim=self.fingerprint_dim,
                 output_dim=self.config.perturbation_embed_dim
@@ -5218,10 +5274,13 @@ Learned Statistics:
         # 3. Setup Metrics Engine
         metrics_engine = ImageMetrics(device=self.config.aux_device)
 
-        # 4. Generate Data (Using Test Set for final evaluation)
-        # Always use test set for evaluation mode to get final paper numbers
+        # 4. STRICT TEST SET ENFORCEMENT
+        # Always use test set for final evaluation - no validation set leakage
+        if len(self.test_dataset) == 0:
+            raise ValueError("Test dataset is empty! Check your split configuration.")
+
         target_dataset = self.test_dataset
-        print(f"Evaluating on {len(target_dataset)} real samples from TEST split...")
+        print(f"Evaluating on TEST split: {len(target_dataset)} samples available")
         
         # Use appropriate loader based on follow_cellflux
         if self.config.follow_cellflux:
@@ -5283,55 +5342,102 @@ Learned Statistics:
         print("Computing KID...")
         kid_score = metrics_engine.compute_kid(real_imgs, fake_imgs)  # Already scaled x1000 in your class
 
-        print("Computing Conditional FID...")
-        fids_c = []
-        if len(compounds) > 0:
-            unique_cmps = np.unique(compounds)
-            for cmp in unique_cmps:
-                idxs = np.where(compounds == cmp)[0]
-                if len(idxs) >= 5:  # Threshold for stability
-                    r_sub = real_feats[idxs]
-                    f_sub = fake_feats[idxs]
-                    try:
-                        fids_c.append(metrics_engine.compute_fid_from_features(r_sub, f_sub))
-                    except: 
-                        pass
-        fid_cond = np.mean(fids_c) if fids_c else 0.0
+        # 6. Compute CONDITIONAL Metrics (Intra-Class) - Enhanced Version
+        print("Computing Conditional Metrics (Per-Compound)...")
 
-        print("Computing Deep MoA Accuracy...")
-        moa_acc = 0.0
+        class_fids = []
+        class_kids = []
+        unique_compounds = np.unique(compounds) if len(compounds) > 0 else np.array([])
+
+        print(f"  Found {len(unique_compounds)} unique compounds in test set.")
+
+        for cpd in unique_compounds:
+            # Filter indices for this compound
+            idxs = np.where(compounds == cpd)[0]
+
+            # Skip if too few samples (FID unstable with N<10)
+            if len(idxs) < 10:
+                continue
+
+            # Slice features/images for this class
+            r_feat_sub = real_feats[idxs]
+            f_feat_sub = fake_feats[idxs]
+
+            r_img_sub = real_imgs[idxs]
+            f_img_sub = fake_imgs[idxs]
+
+            # Compute Class-wise FID
+            try:
+                c_fid = metrics_engine.compute_fid_from_features(r_feat_sub, f_feat_sub)
+                class_fids.append(c_fid)
+            except Exception:
+                pass  # Covariance issues with small N
+
+            # Compute Class-wise KID (more robust for small N)
+            try:
+                c_kid = metrics_engine.compute_kid(r_img_sub, f_img_sub)
+                class_kids.append(c_kid)
+            except Exception:
+                pass
+
+        # Mean Conditional Metrics
+        fid_cond = np.mean(class_fids) if class_fids else 0.0
+        kid_cond = np.mean(class_kids) if class_kids else 0.0
+
+        # 7. Compute MoA Metrics (Accuracy + F1 Scores)
+        print("Computing Deep MoA Metrics (Accuracy & F1)...")
+        moa_metrics = {'acc': 0.0, 'f1_macro': 0.0, 'f1_weighted': 0.0}
+
         if SKLEARN_AVAILABLE and len(moas) > 0:
-            moa_acc = metrics_engine.compute_deep_moa_accuracy(
+            moa_metrics = metrics_engine.compute_deep_moa_metrics(
                 real_feats.cpu().numpy(), fake_feats.cpu().numpy(), moas
             )
 
-        # 6. Run NSCB (Hold-out Batch Generalization)
+        # 8. Run NSCB (Hold-out Batch Generalization)
         print("Running NSCB Benchmark...")
         nscb_metrics = self.run_nscb_benchmark(model)
 
-        # 7. Final Report
-        print("\n" + "="*40)
-        print("FINAL BENCHMARK RESULTS")
-        print("="*40)
-        print(f"FID (All):       {fid_all:.2f}")
-        print(f"FID (Cond):      {fid_cond:.2f}")
-        print(f"KID (x1000):     {kid_score:.2f}")
-        print(f"MoA Accuracy:    {moa_acc*100:.2f}%")
-        print(f"NSCB Profile:    {nscb_metrics.get('nscb_profile_similarity', 0):.4f}")
-        print(f"NSCB MoA:        {nscb_metrics.get('nscb_moa_accuracy', 0)*100:.2f}%")
-        print("="*40)
+        # 9. Final Report (TABLE 6 REPLICATION)
+        print("\n" + "="*110)
+        print("TABLE 6 REPLICATION (Test Set Evaluation)")
+        print("="*110)
+        print(f"{'Method':<15} | {'FIDo':<10} | {'FIDc':<10} | {'KIDo':<10} | {'KIDc':<10} | {'MoA Acc':<10} | {'Macro-F1':<10} | {'W-F1':<10}")
+        print("-" * 110)
 
-        # Save to file
+        # Print results row
+        print(f"{'CellFlux (Test)':<15} | "
+              f"{fid_all:<10.2f} | {fid_cond:<10.2f} | "
+              f"{kid_score:<10.2f} | {kid_cond:<10.2f} | "
+              f"{moa_metrics['acc']*100:<10.1f} | "
+              f"{moa_metrics['f1_macro']*100:<10.1f} | "
+              f"{moa_metrics['f1_weighted']*100:<10.1f}")
+        print("-" * 110)
+
+        # Detailed Breakdown
+        print("\nDETAILED BREAKDOWN:")
+        print(f"  FIDo (Overall):       {fid_all:.4f}  (Global Quality/Diversity)")
+        print(f"  FIDc (Conditional):   {fid_cond:.4f}  (Avg Intra-Class Consistency)")
+        print(f"  KIDo (Overall):       {kid_score:.4f}  (Global Unbiased)")
+        print(f"  KIDc (Conditional):   {kid_cond:.4f}  (Avg Intra-Class Unbiased)")
+        print(f"  MoA Accuracy (1-NN):  {moa_metrics['acc']*100:.2f}%")
+        print(f"  MoA Macro-F1:         {moa_metrics['f1_macro']*100:.2f}%")
+        print(f"  MoA Weighted-F1:      {moa_metrics['f1_weighted']*100:.2f}%")
+        print("="*110)
+
+        # Save to file - TABLE 6 format
         results = {
             "checkpoint": self.config.checkpoint_path,
-            "fid_all": fid_all,
-            "fid_cond": fid_cond,
-            "kid": kid_score,
-            "moa_accuracy": moa_acc,
-            "nscb_profile": nscb_metrics.get('nscb_profile_similarity', 0),
-            "nscb_moa": nscb_metrics.get('nscb_moa_accuracy', 0)
+            "FID_overall": float(fid_all),
+            "FID_conditional": float(fid_cond),
+            "KID_overall": float(kid_score),
+            "KID_conditional": float(kid_cond),
+            "MoA_Accuracy": float(moa_metrics['acc']),
+            "MoA_Macro_F1": float(moa_metrics['f1_macro']),
+            "MoA_Weighted_F1": float(moa_metrics['f1_weighted']),
+            "num_samples": len(real_imgs),
+            "num_classes_evaluated": len(class_fids)
         }
-        res_path = os.path.join(self.output_dir, "final_benchmark_results.json")
+        res_path = os.path.join(self.output_dir, "table6_metrics.json")
         with open(res_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {res_path}")
