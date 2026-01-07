@@ -5138,6 +5138,7 @@ Learned Statistics:
     def run_evaluation_mode(self):
         """
         Dedicated evaluation mode for benchmarking a specific checkpoint.
+        Supports all checkpoint types: Pretrained DDPM, ES, and PPO checkpoints.
         Runs: FID, Conditional FID, KID (Scaled), Deep MoA Accuracy, and NSCB.
         """
         print("\n" + "=" * 80)
@@ -5147,6 +5148,18 @@ Learned Statistics:
 
         if not self.config.checkpoint_path or not os.path.exists(self.config.checkpoint_path):
             raise ValueError(f"Checkpoint not found: {self.config.checkpoint_path}")
+
+        # Detect checkpoint type from filename
+        checkpoint_name = os.path.basename(self.config.checkpoint_path)
+        if 'ddpm_pretrain' in checkpoint_name or 'pretrain' in checkpoint_name.lower():
+            checkpoint_type = "Pretrained DDPM"
+        elif 'ES_config' in checkpoint_name or 'es' in checkpoint_name.lower():
+            checkpoint_type = "ES (Evolution Strategies)"
+        elif 'PPO_config' in checkpoint_name or 'ppo' in checkpoint_name.lower():
+            checkpoint_type = "PPO (Proximal Policy Optimization)"
+        else:
+            checkpoint_type = "Unknown (Generic DDPM)"
+        print(f"Detected checkpoint type: {checkpoint_type}")
 
         # 1. Initialize Model Architecture
         # Create model directly (no need for pretrained model transfer in eval mode)
@@ -5168,12 +5181,32 @@ Learned Statistics:
         # Initialize perturbation encoder (will be loaded from checkpoint if available)
         model.perturbation_encoder = self.chem_encoder
 
-        # 2. Load Weights
+        # 2. Load Weights (handles all checkpoint formats)
         print(f"Loading weights from {self.config.checkpoint_path}...")
         checkpoint = torch.load(self.config.checkpoint_path, map_location=self.config.device, weights_only=False)
-        model.model.load_state_dict(checkpoint['model_state_dict'])
-        if 'perturbation_encoder_state_dict' in checkpoint and model.perturbation_encoder:
-            model.perturbation_encoder.load_state_dict(checkpoint['perturbation_encoder_state_dict'])
+        
+        # Handle different checkpoint formats
+        # Format 1: Standard format from _save_checkpoint (used by pretrain, ES, PPO)
+        if 'model_state_dict' in checkpoint:
+            model.model.load_state_dict(checkpoint['model_state_dict'])
+            if 'perturbation_encoder_state_dict' in checkpoint and model.perturbation_encoder:
+                try:
+                    model.perturbation_encoder.load_state_dict(checkpoint['perturbation_encoder_state_dict'])
+                except Exception as e:
+                    print(f"Warning: Could not load perturbation encoder from checkpoint: {e}")
+                    print("  Using current encoder (may not match checkpoint)")
+            
+            # Print checkpoint metadata if available
+            if 'epoch' in checkpoint:
+                print(f"  Checkpoint epoch: {checkpoint['epoch']}")
+            if 'fid' in checkpoint:
+                print(f"  Checkpoint FID: {checkpoint['fid']:.2f}")
+        else:
+            # Format 2: Direct ImageDDPM.save() format (legacy, less common)
+            # This format stores state_dict directly
+            raise ValueError(f"Unsupported checkpoint format. Expected 'model_state_dict' key. "
+                           f"Found keys: {list(checkpoint.keys())}")
+        
         model.model.eval()
 
         # 3. Setup Metrics Engine
