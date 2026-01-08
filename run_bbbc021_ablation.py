@@ -2684,11 +2684,12 @@ class ImageMetrics:
         """
         Computes KID scaled by 1000 (Target: ~1.62).
         Uses the pre-loaded metric from __init__ for efficiency.
+        Handles cases where sample count is less than subset_size.
         """
         if self.kid_metric is None:
             return 0.0
         
-        self.kid_metric.reset()  # Important: Clear previous batch stats
+        num_samples = min(len(real_images), len(fake_images))
         
         # Convert to Tensor [0, 1] range on correct device
         real_t = torch.tensor(real_images).float().to(self.device)
@@ -2702,11 +2703,24 @@ class ImageMetrics:
         real_t = torch.clamp(real_t, 0, 1)
         fake_t = torch.clamp(fake_t, 0, 1)
         
-        # Update metric
-        self.kid_metric.update(real_t, real=True)
-        self.kid_metric.update(fake_t, real=False)
+        # Handle case where sample count is less than subset_size
+        # The default subset_size is 100, but we may have fewer samples
+        if num_samples < 100:
+            # Create a temporary KID metric with adjusted subset_size
+            from torchmetrics.image.kid import KernelInceptionDistance
+            # Use at least 10 samples, but not more than available
+            adjusted_subset_size = max(10, min(num_samples, 50))
+            temp_kid_metric = KernelInceptionDistance(subset_size=adjusted_subset_size, normalize=True).to(self.device)
+            temp_kid_metric.update(real_t, real=True)
+            temp_kid_metric.update(fake_t, real=False)
+            kid_mean, _ = temp_kid_metric.compute()
+        else:
+            # Use the pre-loaded metric for efficiency
+            self.kid_metric.reset()  # Important: Clear previous batch stats
+            self.kid_metric.update(real_t, real=True)
+            self.kid_metric.update(fake_t, real=False)
+            kid_mean, _ = self.kid_metric.compute()
         
-        kid_mean, _ = self.kid_metric.compute()
         return float(kid_mean.item()) * 1000.0
 
     @staticmethod
