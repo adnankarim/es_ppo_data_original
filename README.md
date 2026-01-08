@@ -11,6 +11,90 @@ This project implements a conditional diffusion model (DDPM) that learns to pred
 
 The model learns a single function capable of generating any perturbation outcome by taking the specific drug identity (via Morgan fingerprint embedding) as input.
 
+# **2. Background & Related Work**
+
+### **2.1 The Unpaired Data Problem in High-Content Screening**
+
+High-Content Screening (HCS) generates massive datasets of cellular morphology to identify the phenotypic effects of chemical or genetic perturbations. However, a critical limitation persists: the imaging process is destructive. We cannot observe the same cell before and after treatment. Consequently, we possess the marginal distribution of control cells, , and the marginal distribution of treated cells, , but the joint trajectory  is lost. This forces us to learn a mapping between unpaired distributions rather than paired samples.
+
+### **2.2 Theoretical Framework: Minimum Entropy Coupling (MEC)**
+
+To reconstruct this missing link, we adopt the principle of **Minimum Entropy Coupling (MEC)**. MEC postulates that among all possible joint distributions that satisfy the observed marginals, the biological reality is likely the one that minimizes the joint entropy .
+
+
+
+Minimizing the conditional entropy  enforces a deterministic coupling, aligning with the biological intuition that a specific drug mechanism (Mode of Action) triggers a consistent, structured morphological change rather than a random stochastic one.
+
+### **2.3 Conditional Denoising Diffusion Probabilistic Models (DDPM)**
+
+While recent works like **CellFlux** (Zhang et al., 2025) explore Flow Matching for distribution alignment, we leverage the robust stability of **Denoising Diffusion Probabilistic Models (DDPM)**. We model the data distribution  by learning to reverse a Markov diffusion process that gradually adds Gaussian noise to the image.
+
+
+
+Our implementation extends the standard DDPM to a **Conditional** setting, where the reverse process is guided by both the reference control state and the drug identity, effectively learning a transition operator .
+
+---
+
+# **3. Methodology**
+
+We propose a **Batch-Aware Conditional Diffusion Framework** for cellular morphology prediction. The system is composed of a U-Net backbone fine-tuned via Reinforcement Learning to maximize biological fidelity.
+
+### **3.1 Architecture: The Conditional U-Net**
+
+The core generator is a pixel-space U-Net operating on  images (Channels: DNA, F-actin, -tubulin).
+
+* **Backbone:** We utilize a 4-stage U-Net with channel multipliers .
+* **DownBlocks/UpBlocks:** Feature extraction is performed via ResNet-style blocks (`ResBlock`) followed by spatial downsampling/upsampling.
+* **Attention Mechanisms:** To capture global context (e.g., cell density, long-range cytoskeletal structures), we inject **Multi-Head Self-Attention** at the deeper resolutions ( and  feature maps).
+
+
+* **Dual Conditioning Mechanism:**
+1. **Structural Conditioning (The Control):** The reference control image  is concatenated channel-wise to the noisy input , resulting in a 6-channel input tensor. This provides the model with the exact spatial layout of the cells to be perturbed.
+2. **Semantic Conditioning (The Drug):** The chemical perturbation  is processed into a dense embedding  (derived from MoLFormer or Morgan Fingerprints). This embedding is injected into every `ResBlock` via a learnable projection layer (scale & shift), effectively modulating the feature maps based on the drug's identity.
+
+
+
+### **3.2 Optimization Strategies (The Ablation Study)**
+
+We rigorously compare two strategies for fine-tuning the U-Net to satisfy biological constraints.
+
+#### **A. Evolution Strategies (ES)**
+
+ES is a gradient-free "black box" optimizer. It treats the diffusion model's parameter vector  as a single point in a high-dimensional fitness landscape.
+
+* **Process:** We spawn a population of  perturbed parameter vectors: .
+* **Update:** The model weights are updated in the direction of the population members that achieve higher biological fidelity (lower FID/Loss).
+
+
+* **Challenge:** While robust to non-differentiable objectives, ES faces the "curse of dimensionality" given the U-Net's millions of parameters.
+
+#### **B. Proximal Policy Optimization (PPO)**
+
+PPO is a policy-gradient Reinforcement Learning algorithm. We treat the iterative denoising process as a "trajectory" and the generated image quality as the "reward."
+
+* **Process:** PPO utilizes the differentiable nature of the U-Net to backpropagate gradients from the reward function directly into the weights.
+* **Constraint:** To prevent "mode collapse" (where the model ignores the physics of diffusion to cheat the reward), we employ a **Clipped Surrogate Objective** that penalizes large deviations from the pre-trained policy:
+
+
+
+### **3.3 The Biological Reward Function**
+
+Standard pixel-wise MSE is insufficient for biology; a cell shifted by 2 pixels has high MSE but perfect biological validity. We introduce a composite **Bio-Perceptual Loss**:
+
+1. **DINOv2 Semantic Loss:** We use **DINOv2**, a self-supervised Vision Transformer, to extract semantic features. DINOv2 is invariant to minor pixel shifts and focuses on texture and object properties (e.g., "is the nucleus fragmented?").
+
+
+2. **DNA Channel Anchoring:** Drug perturbations typically alter the cytoskeleton (Actin/Tubulin) but rarely translocate the nucleus instantly. We enforce a strict pixel-wise constraint on Channel 0 (DNA/DAPI) to "anchor" the prediction to the input control cell's location:
+
+
+
+### **3.4 Experimental Rigor: Batch-Aware Splitting**
+
+Biological datasets suffer from **Batch Effects**—variations in lighting and staining between experiments. A random split allows models to cheat by learning the "style" of a batch rather than the biology of the drug.
+
+* **Protocol:** We implement **Hard Batch-Holdout**. If Batch  is in the Training Set, *zero* images from  appear in Validation or Test.
+* **Sampling:** During training, for every perturbed sample  in Batch , we dynamically sample a control  from the *same* Batch . This forces the model to learn the differential mapping  within the specific noise characteristics of that batch.
+
 ## Dataset: BBBC021
 
 The [BBBC021 dataset](https://bbbc.broadinstitute.org/BBBC021) contains:
