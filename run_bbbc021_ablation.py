@@ -5307,13 +5307,13 @@ Learned Statistics:
             val_loader = BatchPairedDataLoaderCellFlux(
                 target_dataset, 
                 batch_size=self.config.eval_batch_size, 
-                shuffle=False
+                shuffle=True
             )
         else:
             val_loader = BatchPairedDataLoader(
                 target_dataset, 
                 batch_size=self.config.eval_batch_size, 
-                shuffle=False
+                shuffle=True
             )
 
         all_real, all_fake = [], []
@@ -5724,6 +5724,7 @@ def main():
         guidance_scale=args.guidance_scale,
         enable_bio_loss=args.enable_bio_loss,
         aux_device=args.aux_device,
+        eval_split=args.eval_split,
         # [FIX] Connect the argument to the config here:
         unet_channels=args.unet_channels,
     )
@@ -5732,7 +5733,6 @@ def main():
     config.eval_samples = args.eval_samples
     config.checkpoint_path = args.checkpoint_path
     config.eval_batch_size = args.eval_batch_size
-    config.eval_split = args.eval_split
     
     runner = BBBC021AblationRunner(config)
     runner.run()
