@@ -5538,6 +5538,103 @@ Learned Statistics:
         plt.close()
         print(f"Interpolation saved to {save_path}")
 
+    def generate_diffusion_video(self, model, output_filename="diffusion_trajectory.mp4", num_frames=50):
+        """
+        Generates a video showing the gradual denoising process from noise to cell.
+        Args:
+            model: The trained ImageDDPM model.
+            output_filename: Name of the output video file.
+            num_frames: How many intermediate steps to capture (e.g. 50 out of 1000).
+        """
+        print(f"\n[Viz] Generating Diffusion Video: {output_filename}")
+        import imageio
+        model.model.eval()
+
+        # 1. Pick a random sample from the test set
+        # We need a Control image and a Fingerprint
+        dataset = self.test_dataset
+        idx = np.random.randint(len(dataset))
+        data = dataset[idx]
+        
+        control = data['image'].unsqueeze(0).to(self.config.device)
+        fingerprint = data['fingerprint'].unsqueeze(0).to(self.config.device)
+        compound_name = data['compound']
+        
+        print(f"  Target Compound: {compound_name}")
+
+        # 2. Custom Sampling Loop to Capture Frames
+        # We cannot use model.sample() because we need the intermediate x_t states
+        frames = []
+        
+        # Start from random noise
+        x = torch.randn(1, model.in_channels, model.image_size, model.image_size, device=self.config.device)
+        
+        # Prepare embeddings
+        if model.conditional:
+            cond_emb = model.perturbation_encoder(fingerprint)
+        else:
+            cond_emb = None
+            
+        # Diffusion Reverse Loop
+        # We use 'linspace' to pick exactly 'num_frames' evenly spaced steps to save
+        save_steps = set(np.linspace(0, model.timesteps - 1, num_frames, dtype=int))
+        
+        with torch.no_grad():
+            for i in reversed(range(0, model.timesteps)):
+                t = torch.full((1,), i, device=self.config.device, dtype=torch.long)
+                
+                # Predict Noise
+                if model.conditional:
+                    noise_pred = model.model(x, t, control, cond_emb)
+                else:
+                    noise_pred = model.model(x, t)
+
+                # Step (DDPM Update)
+                alpha_t = model.alphas[i]
+                alpha_cumprod_t = model.alphas_cumprod[i]
+                beta_t = model.betas[i]
+                
+                if i > 0:
+                    alpha_cumprod_prev = model.alphas_cumprod[i-1]
+                else:
+                    alpha_cumprod_prev = torch.tensor(1.0).to(self.config.device)
+
+                # Reconstruct x0 (predicted clean image)
+                pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t) * noise_pred) / torch.sqrt(alpha_cumprod_t)
+                pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
+                
+                # Direction pointing to x_t
+                dir_xt = torch.sqrt(1.0 - alpha_cumprod_prev) * noise_pred
+                
+                # Update x
+                x = torch.sqrt(alpha_cumprod_prev) * pred_x0 + dir_xt
+                
+                # Add noise (Langevin dynamics part)
+                if i > 0:
+                    noise = torch.randn_like(x)
+                    sigma_t = torch.sqrt(beta_t)
+                    x = x + sigma_t * noise
+
+                # 3. Capture Frame if it's a save step
+                if i in save_steps or i == 0:
+                    # Normalize [-1, 1] -> [0, 255]
+                    img = x[0].cpu().permute(1, 2, 0).numpy()
+                    img = (img + 1.0) / 2.0  # [0, 1]
+                    img = np.clip(img, 0, 1)
+                    img = (img * 255).astype(np.uint8)
+                    frames.append(img)
+
+        # 4. Save Video
+        output_path = os.path.join(self.plots_dir, output_filename)
+        # fps=10 means the video will play 10 frames per second
+        imageio.mimsave(output_path, frames, fps=10)
+        
+        print(f"  Video saved to: {output_path}")
+
+        # Optional: Log to WandB
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            wandb.log({"video/diffusion_process": wandb.Video(output_path, fps=10, format="mp4")})
+
 
 # ============================================================================
 # MAIN
