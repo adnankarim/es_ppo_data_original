@@ -5477,6 +5477,9 @@ Learned Statistics:
         try:
             video_filename = f"diffusion_video_{checkpoint_type.replace(' ', '_').replace('(', '').replace(')', '')}.mp4"
             self.generate_diffusion_video(model, output_filename=video_filename, num_frames=50)
+            video_path = os.path.join(self.plots_dir, video_filename)
+            print(f"\n✓ Diffusion video saved to: {video_path}")
+            print(f"  You can view it with any video player or check wandb if --use-wandb is enabled.")
         except Exception as e:
             print(f"Warning: Failed to generate diffusion video: {e}")
 
