@@ -5574,13 +5574,14 @@ Learned Statistics:
 
     def generate_diffusion_video(self, model, output_filename="diffusion_trajectory.mp4", num_frames=50):
         """
-        Generates a video showing the gradual denoising process from noise to cell.
+        Generates a Side-by-Side video: [Generation Process] vs [Real Ground Truth].
+        Shows the denoising process on the left and the target real image on the right.
         Args:
             model: The trained ImageDDPM model.
             output_filename: Name of the output video file.
             num_frames: How many intermediate steps to capture (e.g. 50 out of 1000).
         """
-        print(f"\n[Viz] Generating Diffusion Video: {output_filename}")
+        print(f"\n[Viz] Generating Diffusion Video (Side-by-Side): {output_filename}")
         try:
             import imageio
         except ImportError:
@@ -5592,19 +5593,50 @@ Learned Statistics:
         inference_model.eval()
 
         # 1. Pick a random sample from the test set
-        # We need a Control image and a Fingerprint
+        # We need a Control image, Fingerprint, and the Real Target image
         dataset = self.test_dataset
-        idx = np.random.randint(len(dataset))
-        data = dataset[idx]
         
-        control = data['image'].unsqueeze(0).to(self.config.device)
-        fingerprint = data['fingerprint'].unsqueeze(0).to(self.config.device)
-        compound_name = data['compound']
+        # Get a perturbed sample (non-control) to generate
+        perturbed_indices = dataset.get_perturbed_indices() if hasattr(dataset, 'get_perturbed_indices') else list(range(len(dataset)))
+        if not perturbed_indices:
+            # If no perturbed samples, use any sample
+            perturbed_indices = list(range(len(dataset)))
+        
+        perturbed_idx = np.random.choice(perturbed_indices)
+        perturbed_data = dataset[perturbed_idx]
+        
+        compound_name = perturbed_data['compound']
+        fingerprint = perturbed_data['fingerprint'].unsqueeze(0).to(self.config.device)
+        
+        # Get the real target image (perturbed image) - this is what we want to generate
+        real_target_tensor = perturbed_data['image'].unsqueeze(0).to(self.config.device)
+        
+        # Get the control image from the same batch using the dataset's pairing method
+        if hasattr(dataset, 'get_batch_paired_sample'):
+            control_idx, _ = dataset.get_batch_paired_sample(perturbed_idx)
+            control_data = dataset[control_idx]
+            control = control_data['image'].unsqueeze(0).to(self.config.device)
+        else:
+            # Fallback: find any control image
+            control_indices = dataset.get_control_indices() if hasattr(dataset, 'get_control_indices') else []
+            if control_indices:
+                control_idx = np.random.choice(control_indices)
+                control_data = dataset[control_idx]
+                control = control_data['image'].unsqueeze(0).to(self.config.device)
+            else:
+                # Last resort: use the same image (will still work but less meaningful)
+                control = real_target_tensor
         
         print(f"  Target Compound: {compound_name}")
 
+        # Prepare the "Real" image for the video (Right side - Static Target)
+        # Normalize [-1, 1] -> [0, 255]
+        real_img_display = real_target_tensor[0].cpu().permute(1, 2, 0).numpy()
+        real_img_display = (real_img_display + 1.0) / 2.0
+        real_img_display = np.clip(real_img_display, 0, 1)
+        real_img_display = (real_img_display * 255).astype(np.uint8)
+
         # 2. Custom Sampling Loop to Capture Frames
-        # We cannot use model.sample() because we need the intermediate x_t states
         frames = []
         
         # Start from random noise
@@ -5684,12 +5716,17 @@ Learned Statistics:
 
                 # 3. Capture Frame if it's a save step
                 if i in save_steps or i == 0:
-                    # Normalize [-1, 1] -> [0, 255]
-                    img = x[0].cpu().permute(1, 2, 0).numpy()
-                    img = (img + 1.0) / 2.0  # [0, 1]
-                    img = np.clip(img, 0, 1)
-                    img = (img * 255).astype(np.uint8)
-                    frames.append(img)
+                    # Process Generated Image (Left Side)
+                    gen_img = x[0].cpu().permute(1, 2, 0).numpy()
+                    gen_img = (gen_img + 1.0) / 2.0  # [0, 1]
+                    gen_img = np.clip(gen_img, 0, 1)
+                    gen_img = (gen_img * 255).astype(np.uint8)
+
+                    # Stitch Comparison: [Generated] | [Black Separator] | [Real]
+                    separator = np.zeros((model.image_size, 2, 3), dtype=np.uint8)  # Black line (2 pixels wide)
+                    combined_frame = np.hstack([gen_img, separator, real_img_display])
+                    
+                    frames.append(combined_frame)
 
         # 4. Save Video
         output_path = os.path.join(self.plots_dir, output_filename)
@@ -5697,11 +5734,12 @@ Learned Statistics:
         imageio.mimsave(output_path, frames, fps=10)
         
         print(f"  Video saved to: {output_path}")
+        print(f"  Left: Generated (denoising process) | Right: Real Ground Truth")
 
         # Optional: Log to WandB
         if self.config.use_wandb and WANDB_AVAILABLE:
             try:
-                wandb.log({"video/diffusion_process": wandb.Video(output_path, fps=10, format="mp4")})
+                wandb.log({"video/diffusion_comparison": wandb.Video(output_path, fps=10, format="mp4")})
             except Exception as e:
                 print(f"Warning: Failed to log video to wandb: {e}")
 
