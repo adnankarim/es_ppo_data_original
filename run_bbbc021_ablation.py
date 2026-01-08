@@ -321,6 +321,7 @@ class BBBC021Config:
     eval_samples: int = 5000
     checkpoint_path: Optional[str] = None
     eval_batch_size: int = 64
+    eval_split: str = "test"  # [NEW] Split to use for evaluation ('train', 'val', 'test')
     
     # Memory optimization
     gradient_checkpointing: bool = True
@@ -3905,7 +3906,7 @@ class BBBC021AblationRunner:
         cond_ddpm.save(model_path)
         
         # Run NSCB benchmark
-        nscb_results = self.run_nscb_benchmark(cond_ddpm)
+        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.test_dataset)
         final_metrics.update(nscb_results)
         
         # Log NSCB metrics to wandb
@@ -4038,7 +4039,7 @@ class BBBC021AblationRunner:
         self._plot_latent_clusters(cond_ddpm, 'PPO', config_idx)
         model_path = os.path.join(self.models_dir, f'PPO_config_{config_idx}_final.pt')
         cond_ddpm.save(model_path)
-        nscb_results = self.run_nscb_benchmark(cond_ddpm)
+        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.test_dataset)
         final_metrics.update(nscb_results)
         
         # Log NSCB metrics to wandb
@@ -4925,102 +4926,106 @@ Learned Statistics:
         
         print(f"Plots saved to: {plot_path}")
     
-    def run_nscb_benchmark(self, cond_ddpm: ImageDDPM, test_batch_name: str = None) -> Dict:
+    def run_nscb_benchmark(self, cond_ddpm: ImageDDPM, test_batch_name: str = None, dataset=None) -> Dict:
         """
-        Runs the specific NSCB (Not-Same-Compound-or-Batch) evaluation required by the paper.
-        Tests on hold-out batches (e.g., Weeks 9-10) to measure batch generalization.
-        
+        [NEW] Runs the NSCB / OOD Benchmark.
+        Explicitly tests generalization to OOD compounds (e.g. Docetaxel) absent from training.
         Args:
-            cond_ddpm: Trained conditional DDPM model
-            test_batch_name: Specific batch to use for testing (e.g., 'Week10')
-                           If None, uses test split from dataset
-        
-        Returns:
-            Dictionary with NSCB metrics
+            dataset: The dataset to scan for OOD compounds. If None, uses config default (Test).
         """
-        print("\n=== Running NSCB Benchmark (Batch Generalization) ===")
-        
-        # Load Test Data
-        test_dataset = BBBC021Dataset(
-            self.config.data_dir, 
-            self.config.metadata_file, 
-            self.config.image_size, 
-            split="test"
-        )
-        
-        test_loader = BatchPairedDataLoader(
-            test_dataset, 
-            batch_size=self.config.coupling_batch_size, 
-            shuffle=False
-        )
-        
-        real_feats = []
-        fake_feats = []
-        moa_labels = []
-        
+        print("\n" + "=" * 80)
+        print("RUNNING OOD & NSCB BENCHMARK")
+        print("=" * 80)
+
+        # OOD Compounds from CellFlux Paper
+        ood_compounds = [
+            'AZ841', 'cyclohexamide', 'cytochalasin D', 'docetaxel', 
+            'epothilone B', 'lactacystin', 'latrunculin B', 'simvastatin'
+        ]
+        ood_map = {c.lower(): c for c in ood_compounds}
+
         cond_ddpm.model.eval()
+        metrics_engine = ImageMetrics(device=self.config.aux_device)
+
+        # Determine dataset if not passed
+        if dataset is None:
+            # Fallback to test dataset
+            dataset = self.test_dataset
+
+        # Load Data (Shuffle False to scan everything deterministically)
+        # Select correct loader type
+        if self.config.follow_cellflux:
+             loader = BatchPairedDataLoaderCellFlux(
+                dataset, batch_size=self.config.eval_batch_size, shuffle=False
+            )
+        else:
+            loader = BatchPairedDataLoader(
+                dataset, batch_size=self.config.eval_batch_size, shuffle=False
+            )
+
+        print(f"Scanning {len(dataset)} samples for OOD compounds: {ood_compounds}")
+        ood_data = defaultdict(lambda: {'real': [], 'fake': []})
         
         with torch.no_grad():
-            for batch in test_loader:
+            for batch in loader:
+                compounds = batch['compound']
+                
+                # Fast skip if batch has no OOD compounds
+                if not any(c.lower() in ood_map for c in compounds):
+                    continue
+
                 control = batch['control'].to(self.config.device)
+                perturbed = batch['perturbed'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
-                
-                # Get real images
-                real_img = batch['perturbed'].cpu().numpy()
-                
+
                 # Generate
                 gen = cond_ddpm.sample(
-                    len(control), control, fingerprint,
+                    len(control), control, fingerprint, 
                     num_steps=self.config.num_sampling_steps,
                     guidance_scale=self.config.guidance_scale
                 )
-                fake_img = gen.cpu().numpy()
-                
-                # Extract Bio Features (CellFlux methodology)
-                real_feats.append(ApproximateMetrics._get_bio_features(real_img))
-                fake_feats.append(ApproximateMetrics._get_bio_features(fake_img))
-                
-                # Get MoA labels
-                if 'moa_idx' in batch:
-                    moa_labels.extend(batch['moa_idx'].cpu().numpy().tolist())
-        
-        if not real_feats or not fake_feats:
-            print("Warning: No data collected for NSCB benchmark")
-            return {}
-        
-        real_feats = np.vstack(real_feats)
-        fake_feats = np.vstack(fake_feats)
-        
-        # Compute MoA Accuracy using biological features
-        if SKLEARN_AVAILABLE and len(moa_labels) > 0:
-            # [FIX] Ensure inputs are numpy arrays (ApproximateMetrics returns numpy, but just in case)
-            moa_accuracy = ImageMetrics.compute_deep_moa_accuracy(
-                real_feats, 
-                fake_feats, 
-                np.array(moa_labels)
-            )
-            print(f"NSCB MoA Accuracy: {moa_accuracy*100:.2f}%")
-        else:
-            moa_accuracy = 0.0
-            if not SKLEARN_AVAILABLE:
-                print("Warning: sklearn not available, skipping MoA accuracy")
-        
-        # Compute profile similarity
-        dot = np.sum(real_feats * fake_feats, axis=1)
-        norm_r = np.linalg.norm(real_feats, axis=1)
-        norm_f = np.linalg.norm(fake_feats, axis=1)
-        profile_sim = np.mean(dot / (norm_r * norm_f + 1e-8))
-        
-        nscb_metrics = {
-            'nscb_moa_accuracy': float(moa_accuracy),
-            'nscb_profile_similarity': float(profile_sim),
-            'nscb_num_samples': len(real_feats),
-        }
-        
-        print(f"NSCB Profile Similarity: {profile_sim:.4f}")
-        print("NSCB Benchmark Complete.")
-        
-        return nscb_metrics
+
+                # Sort into OOD buckets
+                gen_np = gen.cpu().numpy()
+                real_np = perturbed.cpu().numpy()
+
+                for i, cpd_name in enumerate(compounds):
+                    c_lower = cpd_name.lower()
+                    if c_lower in ood_map:
+                        std_name = ood_map[c_lower]
+                        ood_data[std_name]['real'].append(real_np[i])
+                        ood_data[std_name]['fake'].append(gen_np[i])
+
+        # Compute Metrics per OOD Compound
+        results = {}
+        print("\n--- OOD Generalization Results ---")
+        print(f"{'Compound':<20} | {'FID':<10} | {'KID (x1000)':<12} | {'Samples':<8}")
+        print("-" * 60)
+
+        for cpd, data in ood_data.items():
+            real_imgs = np.stack(data['real'])
+            fake_imgs = np.stack(data['fake'])
+            n_samples = len(real_imgs)
+
+            if n_samples < 10:
+                continue
+
+            r_feat = metrics_engine.get_features(real_imgs)
+            f_feat = metrics_engine.get_features(fake_imgs)
+
+            fid = metrics_engine.compute_fid_from_features(r_feat, f_feat)
+            kid = metrics_engine.compute_kid(real_imgs, fake_imgs)
+
+            results[cpd] = {'fid': fid, 'kid': kid, 'n': n_samples}
+            print(f"{cpd:<20} | {fid:<10.2f} | {kid:<12.2f} | {n_samples:<8}")
+
+        print("-" * 60)
+        ood_path = os.path.join(self.output_dir, "ood_benchmark_results.json")
+        with open(ood_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"OOD results saved to {ood_path}")
+
+        return results
     
     def _run_final_benchmarks(self):
         """Run NSCB benchmarks on best ES and PPO models."""
@@ -5199,6 +5204,7 @@ Learned Statistics:
         print("\n" + "=" * 80)
         print(f"EVALUATION MODE: Benchmarking {self.config.checkpoint_path}")
         print(f"Target Samples: {self.config.eval_samples}")
+        print(f"Target Split:   {self.config.eval_split.upper()}")
         print("=" * 80 + "\n")
 
         if not self.config.checkpoint_path or not os.path.exists(self.config.checkpoint_path):
@@ -5280,13 +5286,21 @@ Learned Statistics:
         # 3. Setup Metrics Engine
         metrics_engine = ImageMetrics(device=self.config.aux_device)
 
-        # 4. STRICT TEST SET ENFORCEMENT
-        # Always use test set for final evaluation - no validation set leakage
-        if len(self.test_dataset) == 0:
-            raise ValueError("Test dataset is empty! Check your split configuration.")
+        # 4. SELECT TARGET DATASET BASED ON CONFIG
+        split_name = self.config.eval_split.lower()
+        if split_name == 'test':
+            target_dataset = self.test_dataset
+        elif split_name == 'val':
+            target_dataset = self.val_dataset
+        elif split_name == 'train':
+            target_dataset = self.train_dataset
+        else:
+            raise ValueError(f"Unknown evaluation split: {split_name}")
 
-        target_dataset = self.test_dataset
-        print(f"Evaluating on TEST split: {len(target_dataset)} samples available")
+        if len(target_dataset) == 0:
+            raise ValueError(f"{split_name.upper()} dataset is empty! Check your split configuration.")
+
+        print(f"Evaluating on {split_name.upper()} split: {len(target_dataset)} samples available")
         
         # Use appropriate loader based on follow_cellflux
         if self.config.follow_cellflux:
@@ -5399,19 +5413,20 @@ Learned Statistics:
                 real_feats.cpu().numpy(), fake_feats.cpu().numpy(), moas
             )
 
-        # 8. Run NSCB (Hold-out Batch Generalization)
-        print("Running NSCB Benchmark...")
-        nscb_metrics = self.run_nscb_benchmark(model)
+        # ----------------------------------------------------------------------
+        # 10. Run OOD Benchmark
+        # ----------------------------------------------------------------------
+        if len(target_dataset) > 100:
+            self.run_nscb_benchmark(model, dataset=target_dataset)
 
-        # 9. Final Report (TABLE 6 REPLICATION)
         print("\n" + "="*110)
-        print("TABLE 6 REPLICATION (Test Set Evaluation)")
+        print(f"TABLE 6 REPLICATION ({split_name.title()} Set)")
         print("="*110)
         print(f"{'Method':<15} | {'FIDo':<10} | {'FIDc':<10} | {'KIDo':<10} | {'KIDc':<10} | {'MoA Acc':<10} | {'Macro-F1':<10} | {'W-F1':<10}")
         print("-" * 110)
 
         # Print results row
-        print(f"{'CellFlux (Test)':<15} | "
+        print(f"{'CellFlux':<15} | "
               f"{fid_all:<10.2f} | {fid_cond:<10.2f} | "
               f"{kid_score:<10.2f} | {kid_cond:<10.2f} | "
               f"{moa_metrics['acc']*100:<10.1f} | "
@@ -5430,20 +5445,20 @@ Learned Statistics:
         print(f"  MoA Weighted-F1:      {moa_metrics['f1_weighted']*100:.2f}%")
         print("="*110)
 
-        # Save to file - TABLE 6 format
+        # Save results
         results = {
             "checkpoint": self.config.checkpoint_path,
-            "FID_overall": float(fid_all),
-            "FID_conditional": float(fid_cond),
-            "KID_overall": float(kid_score),
-            "KID_conditional": float(kid_cond),
-            "MoA_Accuracy": float(moa_metrics['acc']),
-            "MoA_Macro_F1": float(moa_metrics['f1_macro']),
-            "MoA_Weighted_F1": float(moa_metrics['f1_weighted']),
-            "num_samples": len(real_imgs),
-            "num_classes_evaluated": len(class_fids)
+            "split": split_name,
+            "FID_overall": fid_all,
+            "FID_conditional": fid_cond,
+            "KID_overall": kid_score,
+            "KID_conditional": kid_cond,
+            "MoA_Accuracy": moa_metrics['acc'],
+            "MoA_Macro_F1": moa_metrics['f1_macro'],
+            "MoA_Weighted_F1": moa_metrics['f1_weighted'],
+            "num_samples": len(real_imgs)
         }
-        res_path = os.path.join(self.output_dir, "table6_metrics.json")
+        res_path = os.path.join(self.output_dir, f"table6_metrics_{split_name}.json")
         with open(res_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {res_path}")
@@ -5663,6 +5678,8 @@ def main():
                         help="Path to specific model checkpoint (.pt) to evaluate")
     parser.add_argument("--eval-batch-size", type=int, default=64,
                         help="Batch size for evaluation generation")
+    parser.add_argument("--eval-split", type=str, default="test", choices=["train", "val", "test"],
+                        help="Dataset split to use for evaluation mode (train, val, test)")
     
     args = parser.parse_args()
     
@@ -5715,6 +5732,7 @@ def main():
     config.eval_samples = args.eval_samples
     config.checkpoint_path = args.checkpoint_path
     config.eval_batch_size = args.eval_batch_size
+    config.eval_split = args.eval_split
     
     runner = BBBC021AblationRunner(config)
     runner.run()
