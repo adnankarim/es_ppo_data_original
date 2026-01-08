@@ -3399,6 +3399,13 @@ class BBBC021AblationRunner:
             viz_model = self._create_conditional_ddpm(pretrain_ddpm) # Re-init architecture
             viz_model.load(best_model_path)
             self.generate_interpolation(viz_model, start_compound='DMSO', end_compound='Taxol')
+            # Generate diffusion video showing the denoising process
+            try:
+                method_name = self.config.method if self.config.mode == "single" else "PPO"
+                video_filename = f"{method_name}_diffusion_trajectory.mp4"
+                self.generate_diffusion_video(viz_model, output_filename=video_filename, num_frames=50)
+            except Exception as e:
+                print(f"Warning: Failed to generate diffusion video: {e}")
         else:
             print("Warning: Best model not found. Skipping interpolation visualization.")
         
@@ -5462,6 +5469,16 @@ Learned Statistics:
         with open(res_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to {res_path}")
+        
+        # Generate diffusion video visualization
+        print("\n" + "="*80)
+        print("GENERATING DIFFUSION VIDEO VISUALIZATION")
+        print("="*80)
+        try:
+            video_filename = f"diffusion_video_{checkpoint_type.replace(' ', '_').replace('(', '').replace(')', '')}.mp4"
+            self.generate_diffusion_video(model, output_filename=video_filename, num_frames=50)
+        except Exception as e:
+            print(f"Warning: Failed to generate diffusion video: {e}")
 
     def generate_interpolation(self, model, start_compound='DMSO', end_compound='Taxol', steps=8):
         """
@@ -5547,8 +5564,15 @@ Learned Statistics:
             num_frames: How many intermediate steps to capture (e.g. 50 out of 1000).
         """
         print(f"\n[Viz] Generating Diffusion Video: {output_filename}")
-        import imageio
-        model.model.eval()
+        try:
+            import imageio
+        except ImportError:
+            print("  ERROR: imageio not installed. Install with: pip install imageio[ffmpeg]")
+            return
+        
+        # Use EMA model for sampling if available
+        inference_model = model.ema_model if (model.use_ema and model.ema_model is not None) else model.model
+        inference_model.eval()
 
         # 1. Pick a random sample from the test set
         # We need a Control image and a Fingerprint
@@ -5569,51 +5593,77 @@ Learned Statistics:
         # Start from random noise
         x = torch.randn(1, model.in_channels, model.image_size, model.image_size, device=self.config.device)
         
-        # Prepare embeddings
-        if model.conditional:
+        # Prepare embeddings for CFG (Classifier-Free Guidance)
+        if model.conditional and fingerprint is not None:
+            # 1. Conditional Embedding
             cond_emb = model.perturbation_encoder(fingerprint)
+            # 2. Unconditional Embedding (Zeros)
+            uncond_emb = torch.zeros_like(cond_emb)
         else:
             cond_emb = None
-            
+            uncond_emb = None
+        
+        # Get guidance scale from config (default 4.0)
+        guidance_scale = getattr(self.config, 'guidance_scale', 4.0)
+        
         # Diffusion Reverse Loop
         # We use 'linspace' to pick exactly 'num_frames' evenly spaced steps to save
         save_steps = set(np.linspace(0, model.timesteps - 1, num_frames, dtype=int))
         
+        # Use step_size similar to sample() method for efficiency
+        # But we still iterate through all steps to capture frames
+        step_size = 1  # Capture every step for smooth video
+        
         with torch.no_grad():
-            for i in reversed(range(0, model.timesteps)):
+            for i in reversed(range(0, model.timesteps, step_size)):
                 t = torch.full((1,), i, device=self.config.device, dtype=torch.long)
                 
-                # Predict Noise
-                if model.conditional:
-                    noise_pred = model.model(x, t, control, cond_emb)
+                # Predict noise with CFG extrapolation (matching sample() method)
+                if model.conditional and guidance_scale > 1.0:
+                    # A. Conditional Pass
+                    noise_cond = inference_model(x, t, control, cond_emb)
+                    
+                    # B. Unconditional Pass
+                    noise_uncond = inference_model(x, t, control, uncond_emb)
+                    
+                    # C. Extrapolate (CFG Formula)
+                    # noise = noise_uncond + s * (noise_cond - noise_uncond)
+                    noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+                elif model.conditional:
+                    # Standard conditional sampling (s=1.0)
+                    noise_pred = inference_model(x, t, control, cond_emb)
                 else:
-                    noise_pred = model.model(x, t)
+                    noise_pred = inference_model(x, t)
+                
+                # Clamp noise prediction
+                noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
 
-                # Step (DDPM Update)
+                # Step (DDPM Update) - matching sample() method logic
                 alpha_t = model.alphas[i]
                 alpha_cumprod_t = model.alphas_cumprod[i]
                 beta_t = model.betas[i]
                 
                 if i > 0:
-                    alpha_cumprod_prev = model.alphas_cumprod[i-1]
+                    alpha_cumprod_t_prev = model.alphas_cumprod[i - step_size] if i >= step_size else model.alphas_cumprod[0]
                 else:
-                    alpha_cumprod_prev = torch.tensor(1.0).to(self.config.device)
+                    alpha_cumprod_t_prev = torch.tensor(1.0, device=self.config.device)
 
-                # Reconstruct x0 (predicted clean image)
-                pred_x0 = (x - torch.sqrt(1 - alpha_cumprod_t) * noise_pred) / torch.sqrt(alpha_cumprod_t)
+                # Compute x_{t-1}
+                sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod_t)
+                sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - alpha_cumprod_t)
+                
+                pred_x0 = (x - sqrt_one_minus_alpha_cumprod_t * noise_pred) / (sqrt_alpha_cumprod_t + 1e-8)
                 pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
                 
-                # Direction pointing to x_t
-                dir_xt = torch.sqrt(1.0 - alpha_cumprod_prev) * noise_pred
+                dir_xt = torch.sqrt(1.0 - alpha_cumprod_t_prev) * noise_pred
+                x = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + dir_xt
                 
-                # Update x
-                x = torch.sqrt(alpha_cumprod_prev) * pred_x0 + dir_xt
-                
-                # Add noise (Langevin dynamics part)
                 if i > 0:
                     noise = torch.randn_like(x)
                     sigma_t = torch.sqrt(beta_t)
                     x = x + sigma_t * noise
+                
+                x = torch.clamp(x, -1.0, 1.0)
 
                 # 3. Capture Frame if it's a save step
                 if i in save_steps or i == 0:
@@ -5633,7 +5683,10 @@ Learned Statistics:
 
         # Optional: Log to WandB
         if self.config.use_wandb and WANDB_AVAILABLE:
-            wandb.log({"video/diffusion_process": wandb.Video(output_path, fps=10, format="mp4")})
+            try:
+                wandb.log({"video/diffusion_process": wandb.Video(output_path, fps=10, format="mp4")})
+            except Exception as e:
+                print(f"Warning: Failed to log video to wandb: {e}")
 
 
 # ============================================================================
