@@ -646,7 +646,7 @@ class BBBC021Dataset(Dataset):
             metadata_path = Path(metadata_file)
         else:
             # Otherwise, assume it's relative to data_dir
-            metadata_path = self.data_dir / metadata_file
+        metadata_path = self.data_dir / metadata_file
         
         if not metadata_path.exists():
             raise FileNotFoundError(
@@ -938,7 +938,7 @@ class BBBC021Dataset(Dataset):
                 nested_path = self.data_dir / f"Week{week}" / plate / f"{filename}.npy"
                 if nested_path.exists():
                     full_path = nested_path
-                else:
+        else:
                     # Also try without .npy extension in filename
                     nested_path_no_ext = self.data_dir / f"Week{week}" / plate / filename
                     if nested_path_no_ext.exists():
@@ -2759,7 +2759,7 @@ class ImagePPOTrainer:
                 noise_pred_pretrain = self.pretrain_model.model(x_t, t, control_batch, pt_emb)
             else:
                 # Fallback for old unconditional models
-                noise_pred_pretrain = self.pretrain_model.model(x_t, t)
+            noise_pred_pretrain = self.pretrain_model.model(x_t, t)
         
         kl_loss = F.mse_loss(noise_pred_cond, noise_pred_pretrain)
         
@@ -3415,13 +3415,13 @@ class BBBC021AblationRunner:
             print(f"  Saved splits to: {temp_dir}")
             
             # 3. Load datasets - PASS THE ABSOLUTE PATHS
-            self.train_dataset = BBBC021Dataset(
+        self.train_dataset = BBBC021Dataset(
                 config.data_dir, train_csv_path,  # Passing absolute path
                 config.image_size, split="train",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
-            )
-            self.val_dataset = BBBC021Dataset(
+        )
+        self.val_dataset = BBBC021Dataset(
                 config.data_dir, val_csv_path,
                 config.image_size, split="val",
                 morgan_encoder=self.chem_encoder,
@@ -3432,7 +3432,7 @@ class BBBC021AblationRunner:
                 config.image_size, split="test",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
-            )
+        )
         
         # Initialize wandb
         if config.use_wandb and WANDB_AVAILABLE:
@@ -3502,7 +3502,7 @@ class BBBC021AblationRunner:
             # 3. Load Optimizer (if applicable)
             if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None and not skip_optimizer:
                 try:
-                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                 except ValueError:
                     print("  Warning: Optimizer param groups mismatch. Skipping optimizer load.")
             elif skip_optimizer:
@@ -3553,7 +3553,7 @@ class BBBC021AblationRunner:
         # Add FID to state if provided
         if fid is not None:
             state['fid'] = fid
-        
+            
         # Save to local run
         torch.save(state, os.path.join(self.models_dir, filename))
         
@@ -3924,12 +3924,13 @@ class BBBC021AblationRunner:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
+                fid_cond = metrics.get('fid_conditional', 0.0)  # Conditional FID (per-compound avg)
                 kid_score = metrics.get('kid', 0.0)  # Extract KID
                 kl_score = metrics.get('kl_div_total', 0.0)
                 mi_score = metrics.get('mutual_information', 0.0)
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID: {fid_score:.2f} | KID: {kid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | FID(All): {fid_score:.2f} | FID(Cond): {fid_cond:.2f} | KID: {kid_score:.2f} | KL: {kl_score:.4f} | MI: {mi_score:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
                 
                 # Update Best Metrics
                 if not self.config.follow_cellflux:
@@ -4080,7 +4081,7 @@ class BBBC021AblationRunner:
         # Logic: If we are still in warmup, finish warmup first, THEN do the requested ES epochs
         # If we are past warmup, just do the requested ES epochs
         
-        run_warmup = False
+            run_warmup = False
         warmup_start = 0
         
         if start_epoch < self.config.warmup_epochs:
@@ -4659,9 +4660,10 @@ class BBBC021AblationRunner:
     
     def _evaluate_pretrain(self, ddpm: ImageDDPM, dataset, max_samples: int = None) -> Dict:
         """
-        [FIXED] Evaluate pretrained conditional DDPM.
+        [FIXED] Evaluate pretrained conditional DDPM with Conditional FID.
         Uses exactly max_samples if provided, otherwise defaults to num_eval_samples (5000).
         Supports dynamic evaluation (QUICK: 500, FULL: 5000).
+        Now includes Conditional FID calculation (per-compound average).
         """
         ddpm.model.eval()
         
@@ -4679,6 +4681,8 @@ class BBBC021AblationRunner:
         num_samples = max_samples  # Use exactly this many, no less
         real_images = []
         fake_images = []
+        compounds = []  # Track compounds for Conditional FID
+        moas = []  # Track MoA labels
         
         dataloader = DataLoader(
             dataset, 
@@ -4696,6 +4700,12 @@ class BBBC021AblationRunner:
                 fingerprints = batch['fingerprint'].to(self.config.device)
                 real_images.append(images.cpu().numpy())
                 
+                # Extract compound labels for Conditional FID
+                if 'compound' in batch:
+                    compounds.extend(batch['compound'])
+                if 'moa_idx' in batch:
+                    moas.extend(batch['moa_idx'].cpu().tolist())
+                
                 if ddpm.conditional:
                     dummy_control = torch.zeros_like(images)
                     generated = ddpm.sample(
@@ -4710,25 +4720,52 @@ class BBBC021AblationRunner:
         # Flatten lists and truncate to exact num_samples
         real_images = np.concatenate(real_images, axis=0)[:num_samples]
         fake_images = np.concatenate(fake_images, axis=0)[:num_samples]
+        compounds = np.array(compounds[:num_samples])
+        moas = np.array(moas[:num_samples])
         
         # Verify we got exactly the right number
         actual_samples = len(real_images)
         if actual_samples != num_samples:
             print(f"WARNING: Expected {num_samples} samples but got {actual_samples}")
         
-        # 3. Calculate FID using the new device-aware method (on aux device)
-        fid = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.aux_device)
+        # 3. Calculate Overall FID using the new device-aware method (on aux device)
+        fid_overall = ImageMetrics.compute_fid(real_images, fake_images, device=self.config.aux_device)
         
-        # Calculate fast metrics
+        # 4. Calculate Conditional FID (Per-compound Average) - Key Metric
+        metrics_engine = ImageMetrics(device=self.config.aux_device)
+        fid_conditional = 0.0
+        per_class_fids = {}
+        
+        if len(compounds) > 0 and len(np.unique(compounds)) > 1:
+            print("  Computing Conditional FID (per-compound average)...")
+            # Extract features for both real and fake images
+            real_feats = metrics_engine.get_features(real_images)
+            fake_feats = metrics_engine.get_features(fake_images)
+            
+            # Compute Conditional FID using pre-extracted features
+            fid_conditional, per_class_fids = metrics_engine.compute_conditional_fid(
+                real_feats, fake_feats, compounds
+            )
+            print(f"    Overall FID (FID_o): {fid_overall:.2f} | Conditional FID (FID_c): {fid_conditional:.2f} (avg over {len(per_class_fids)} compounds)")
+        
+        # 5. Calculate fast metrics
         mse = ImageMetrics.compute_mse(real_images, fake_images)
         mae = ImageMetrics.compute_mae(real_images, fake_images)
         ssim = ImageMetrics.compute_ssim(real_images, fake_images)
         info_metrics = ApproximateMetrics.compute_all(real_images, fake_images)
         
-        metrics = {'fid': fid, 'mse': mse, 'mae': mae, 'ssim': ssim, 'num_eval_samples': actual_samples}
+        metrics = {
+            'fid': fid_overall,                    # Overall FID (FID_o)
+            'fid_conditional': fid_conditional,     # Conditional FID (FID_c) - KEY METRIC
+            'fid_per_class': per_class_fids,        # Per-compound breakdown
+            'mse': mse, 
+            'mae': mae, 
+            'ssim': ssim, 
+            'num_eval_samples': actual_samples
+        }
         metrics.update(info_metrics)
         
-        # Log all metrics to wandb (including FID)
+        # Log all metrics to wandb (including both FID metrics)
         self._log_metrics_to_wandb(metrics, prefix="pretrain/evaluation/")
         
         return metrics
@@ -4919,7 +4956,7 @@ class BBBC021AblationRunner:
             with open(final_path, mode, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=keys)
                 if not file_exists:
-                    writer.writeheader()
+                writer.writeheader()
                 writer.writerows(metrics)
         except Exception as e:
             print(f"Warning: Failed to save metrics to CSV: {e}")
