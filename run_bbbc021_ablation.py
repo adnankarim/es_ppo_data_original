@@ -2759,7 +2759,7 @@ class ImagePPOTrainer:
                 noise_pred_pretrain = self.pretrain_model.model(x_t, t, control_batch, pt_emb)
             else:
                 # Fallback for old unconditional models
-            noise_pred_pretrain = self.pretrain_model.model(x_t, t)
+                noise_pred_pretrain = self.pretrain_model.model(x_t, t)
         
         kl_loss = F.mse_loss(noise_pred_cond, noise_pred_pretrain)
         
