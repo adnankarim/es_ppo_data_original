@@ -4081,7 +4081,7 @@ class BBBC021AblationRunner:
         # Logic: If we are still in warmup, finish warmup first, THEN do the requested ES epochs
         # If we are past warmup, just do the requested ES epochs
         
-            run_warmup = False
+        run_warmup = False
         warmup_start = 0
         
         if start_epoch < self.config.warmup_epochs:
@@ -4956,7 +4956,7 @@ class BBBC021AblationRunner:
             with open(final_path, mode, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=keys)
                 if not file_exists:
-                writer.writeheader()
+                    writer.writeheader()
                 writer.writerows(metrics)
         except Exception as e:
             print(f"Warning: Failed to save metrics to CSV: {e}")
