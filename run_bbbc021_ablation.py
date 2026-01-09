@@ -494,9 +494,9 @@ class MorganFingerprintEncoder:
         if smiles not in self.cache:
             # Hash the string to seed the random generator for consistency
             np.random.seed(hash(str(smiles)) % (2**32))
-            arr = np.random.rand(self.n_bits).astype(np.float32)
-            arr = (arr > 0.5).astype(np.float32)
-            self.cache[smiles] = arr
+        arr = np.random.rand(self.n_bits).astype(np.float32)
+        arr = (arr > 0.5).astype(np.float32)
+        self.cache[smiles] = arr
             
         return self.cache[smiles]
 
@@ -678,7 +678,7 @@ class BBBC021Dataset(Dataset):
 
                 # 2. Determine Split (Strict adherence to CSV SPLIT column)
                 row_split = (row.get('split') or row.get('SPLIT') or '').lower()
-                
+                    
                 # Filter by SPLIT (Strict adherence to CSV)
                 if row_split != self.split:
                     continue
@@ -906,20 +906,80 @@ class BBBC021Dataset(Dataset):
         Load BBBC021 image with ROBUST NORMALIZATION.
         Safely handles uint8, uint16, and float inputs to ensure [-1, 1] range.
         CRASHES if file is missing (No synthetic fallback).
+        
+        Handles path conversion: CSV paths like 'Week7_34681_7_3317_204.0' 
+        are converted to nested 'Week7/34681/7_3317_204.0.npy'
         """
-        # 1. Resolve Path
+        import re
+        
+        # 1. Resolve Path - Try multiple strategies
+        # Strategy 1: Direct path (if CSV already has correct format)
         base_path = self.data_dir / image_path
-        # Try finding the file with or without extension
+        full_path = None
+        
+        # Remove .npy extension if present
+        clean_path = image_path.rstrip('.npy')
+        
         if base_path.exists():
             full_path = base_path
-        elif (self.data_dir / (str(image_path) + '.npy')).exists():
-            full_path = self.data_dir / (str(image_path) + '.npy')
+        elif (self.data_dir / (clean_path + '.npy')).exists():
+            full_path = self.data_dir / (clean_path + '.npy')
         else:
-            # CRITICAL FIX: Raise error instead of generating noise
-            raise FileNotFoundError(
-                f"[CRITICAL] Image not found: {base_path}\n"
-                f"Check --data-dir. The CSV path must exist relative to it."
-            )
+            # Strategy 2: Convert flat CSV path to nested structure
+            # CSV format: "Week7_34681_7_3317_204.0" -> "Week7/34681/7_3317_204.0.npy"
+            # Pattern: Week{week}_{plate}_{rest}
+            match = re.match(r'^Week(\d+)_(\d+)_(.+)$', clean_path)
+            if match:
+                week = match.group(1)
+                plate = match.group(2)
+                filename = match.group(3)
+                
+                # Construct nested path: Week{week}/{plate}/{filename}.npy
+                nested_path = self.data_dir / f"Week{week}" / plate / f"{filename}.npy"
+                if nested_path.exists():
+                    full_path = nested_path
+                else:
+                    # Also try without .npy extension in filename
+                    nested_path_no_ext = self.data_dir / f"Week{week}" / plate / filename
+                    if nested_path_no_ext.exists():
+                        full_path = nested_path_no_ext
+        
+        # Strategy 3: Recursive search as last resort (slower but comprehensive)
+        if full_path is None:
+            # Try recursive glob search for the filename
+            filename_only = Path(clean_path).name
+            if not filename_only.endswith('.npy'):
+                filename_only += '.npy'
+            
+            # Search for files matching the pattern
+            for pattern in [filename_only, clean_path.split('_')[-1] + '.npy']:
+                matches = list(self.data_dir.rglob(pattern))
+                if matches:
+                    full_path = matches[0]
+                    break
+        
+        # If still not found, raise error with helpful message
+        if full_path is None or not full_path.exists():
+            # Try to suggest the nested path format
+            match = re.match(r'^Week(\d+)_(\d+)_(.+)$', clean_path)
+            if match:
+                week = match.group(1)
+                plate = match.group(2)
+                filename = match.group(3)
+                suggested_path = f"Week{week}/{plate}/{filename}.npy"
+                raise FileNotFoundError(
+                    f"[CRITICAL] Image not found!\n"
+                    f"  CSV path: {image_path}\n"
+                    f"  Tried: {base_path}\n"
+                    f"  Tried: {self.data_dir / (clean_path + '.npy')}\n"
+                    f"  Expected nested: {self.data_dir / suggested_path}\n"
+                    f"  Solution: Check if file exists at: {suggested_path}"
+                )
+            else:
+                raise FileNotFoundError(
+                    f"[CRITICAL] Image not found: {base_path}\n"
+                    f"Check --data-dir. The CSV path must exist relative to it."
+                )
 
         # 2. Load and Normalize
         try:
@@ -1662,20 +1722,80 @@ class BBBC021DatasetCellFlux(Dataset):
         Load BBBC021 image with ROBUST NORMALIZATION.
         Safely handles uint8, uint16, and float inputs to ensure [-1, 1] range.
         CRASHES if file is missing (No synthetic fallback).
+        
+        Handles path conversion: CSV paths like 'Week7_34681_7_3317_204.0' 
+        are converted to nested 'Week7/34681/7_3317_204.0.npy'
         """
-        # 1. Resolve Path
+        import re
+        
+        # 1. Resolve Path - Try multiple strategies
+        # Strategy 1: Direct path (if CSV already has correct format)
         base_path = self.data_dir / image_path
-        # Try finding the file with or without extension
+        full_path = None
+        
+        # Remove .npy extension if present
+        clean_path = image_path.rstrip('.npy')
+        
         if base_path.exists():
             full_path = base_path
-        elif (self.data_dir / (str(image_path) + '.npy')).exists():
-            full_path = self.data_dir / (str(image_path) + '.npy')
+        elif (self.data_dir / (clean_path + '.npy')).exists():
+            full_path = self.data_dir / (clean_path + '.npy')
         else:
-            # CRITICAL FIX: Raise error instead of generating noise
-            raise FileNotFoundError(
-                f"[CRITICAL] Image not found: {base_path}\n"
-                f"Check --data-dir. The CSV path must exist relative to it."
-            )
+            # Strategy 2: Convert flat CSV path to nested structure
+            # CSV format: "Week7_34681_7_3317_204.0" -> "Week7/34681/7_3317_204.0.npy"
+            # Pattern: Week{week}_{plate}_{rest}
+            match = re.match(r'^Week(\d+)_(\d+)_(.+)$', clean_path)
+            if match:
+                week = match.group(1)
+                plate = match.group(2)
+                filename = match.group(3)
+                
+                # Construct nested path: Week{week}/{plate}/{filename}.npy
+                nested_path = self.data_dir / f"Week{week}" / plate / f"{filename}.npy"
+                if nested_path.exists():
+                    full_path = nested_path
+                else:
+                    # Also try without .npy extension in filename
+                    nested_path_no_ext = self.data_dir / f"Week{week}" / plate / filename
+                    if nested_path_no_ext.exists():
+                        full_path = nested_path_no_ext
+        
+        # Strategy 3: Recursive search as last resort (slower but comprehensive)
+        if full_path is None:
+            # Try recursive glob search for the filename
+            filename_only = Path(clean_path).name
+            if not filename_only.endswith('.npy'):
+                filename_only += '.npy'
+            
+            # Search for files matching the pattern
+            for pattern in [filename_only, clean_path.split('_')[-1] + '.npy']:
+                matches = list(self.data_dir.rglob(pattern))
+                if matches:
+                    full_path = matches[0]
+                    break
+        
+        # If still not found, raise error with helpful message
+        if full_path is None or not full_path.exists():
+            # Try to suggest the nested path format
+            match = re.match(r'^Week(\d+)_(\d+)_(.+)$', clean_path)
+            if match:
+                week = match.group(1)
+                plate = match.group(2)
+                filename = match.group(3)
+                suggested_path = f"Week{week}/{plate}/{filename}.npy"
+                raise FileNotFoundError(
+                    f"[CRITICAL] Image not found!\n"
+                    f"  CSV path: {image_path}\n"
+                    f"  Tried: {base_path}\n"
+                    f"  Tried: {self.data_dir / (clean_path + '.npy')}\n"
+                    f"  Expected nested: {self.data_dir / suggested_path}\n"
+                    f"  Solution: Check if file exists at: {suggested_path}"
+                )
+            else:
+                raise FileNotFoundError(
+                    f"[CRITICAL] Image not found: {base_path}\n"
+                    f"Check --data-dir. The CSV path must exist relative to it."
+                )
 
         # 2. Load and Normalize
         try:
@@ -2754,7 +2874,7 @@ class ImageMetrics:
         mu1, sigma1 = self._compute_stats(real_features.cpu().numpy())
         mu2, sigma2 = self._compute_stats(fake_features.cpu().numpy())
         return self._calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
-
+    
     @staticmethod
     def _compute_stats(features):
         mu = np.mean(features, axis=0)
@@ -2840,7 +2960,7 @@ class ImageMetrics:
         """
         if self.kid_metric is None:
             return 0.0
-        
+
         num_samples = min(len(real_images), len(fake_images))
         
         # Convert to Tensor [0, 1] range on correct device
@@ -2957,7 +3077,7 @@ class ImageMetrics:
         """
         diff = np.abs(real_controls - fake_perturbed)
         return float(np.mean(diff))
-
+    
     @staticmethod
     def compute_mse(real_images: np.ndarray, fake_images: np.ndarray) -> float:
         return float(np.mean((real_images - fake_images) ** 2))
@@ -3377,7 +3497,7 @@ class BBBC021AblationRunner:
                 return self.config.ddpm_epochs
                 
             return ckpt.get('epoch', 0)
-
+        
         except RuntimeError as e:
             # 5. CATCH DIMENSION MISMATCH
             if "size mismatch" in str(e) or "Missing key" in str(e) or "Unexpected key" in str(e):
@@ -3413,7 +3533,7 @@ class BBBC021AblationRunner:
         }
         if model.perturbation_encoder:
             state['perturbation_encoder_state_dict'] = model.perturbation_encoder.state_dict()
-        
+            
         # Add FID to state if provided
         if fid is not None:
             state['fid'] = fid
@@ -3841,7 +3961,7 @@ class BBBC021AblationRunner:
 
             # 3. Checkpoint
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
-        
+            
         # Final evaluation at last epoch (for CellFlux mode reporting)
         if self.config.follow_cellflux and (target_epoch - 1) % 150 != 0:
             # If we didn't evaluate at the final epoch, do it now
@@ -4277,9 +4397,9 @@ class BBBC021AblationRunner:
         )
         
         if len(test_dataset) == 0:
-             print("Warning: No test data found. Skipping NSCB.")
-             return {}
-
+            print("Warning: No test data found. Skipping NSCB.")
+            return {}
+        
         test_loader = BatchPairedDataLoader(
             test_dataset, 
             batch_size=self.config.coupling_batch_size, 
@@ -4380,7 +4500,7 @@ class BBBC021AblationRunner:
                 
                 # Generate
                 generated = cond_ddpm.sample(
-                    len(control), control, fingerprint, 
+                    len(control), control, fingerprint,
                     num_steps=self.config.num_sampling_steps,
                     guidance_scale=self.config.guidance_scale
                 )
@@ -4394,7 +4514,7 @@ class BBBC021AblationRunner:
                     all_moas.extend(batch['moa_idx'].cpu().numpy().tolist())
                 
                 num_samples += len(control)
-
+        
         # Concatenate
         real_imgs = np.concatenate(all_real, axis=0)[:max_samples]
         fake_imgs = np.concatenate(all_fake, axis=0)[:max_samples]
@@ -4476,7 +4596,7 @@ class BBBC021AblationRunner:
         # D. Additional metrics
         pixel_change = ImageMetrics.compute_pixel_change(real_imgs, fake_imgs)  # Approximate
         info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
-
+        
         metrics = {
             'fid': fid_overall,                    # Overall FID (FID_o): Global quality/diversity
             'fid_conditional': fid_conditional,    # Conditional FID (FID_c): Per-compound consistency
@@ -4753,7 +4873,7 @@ class BBBC021AblationRunner:
         if 'epoch' in keys:
             keys.remove('epoch')
             keys.insert(0, 'epoch')
-            
+        
         try:
             with open(final_path, mode, newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=keys)
@@ -5170,8 +5290,8 @@ Learned Statistics:
         else:
             loader = BatchPairedDataLoader(
                 dataset, batch_size=self.config.eval_batch_size, shuffle=False
-            )
-
+        )
+        
         print(f"Scanning {len(dataset)} samples for OOD compounds: {ood_compounds}")
         ood_data = defaultdict(lambda: {'real': [], 'fake': []})
         
@@ -5186,10 +5306,10 @@ Learned Statistics:
                 control = batch['control'].to(self.config.device)
                 perturbed = batch['perturbed'].to(self.config.device)
                 fingerprint = batch['fingerprint'].to(self.config.device)
-
+                
                 # Generate
                 gen = cond_ddpm.sample(
-                    len(control), control, fingerprint, 
+                    len(control), control, fingerprint,
                     num_steps=self.config.num_sampling_steps,
                     guidance_scale=self.config.guidance_scale
                 )
@@ -5233,7 +5353,7 @@ Learned Statistics:
         with open(ood_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"OOD results saved to {ood_path}")
-
+        
         return results
     
     def _run_final_benchmarks(self):
