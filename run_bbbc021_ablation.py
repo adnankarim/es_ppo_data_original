@@ -899,58 +899,75 @@ class BBBC021Dataset(Dataset):
         }
     
     def _load_image(self, image_path: str) -> torch.Tensor:
-        """[FIXED] Load IMPA 96x96 uint8 crops with Global Scaling."""
-        if not image_path.endswith('.npy'):
-            image_path += '.npy'
-            
-        full_path = self.data_dir / image_path
-        
-        if full_path.exists():
-            try:
-                # 1. Load data (uint8 0-255)
-                img_array = np.load(str(full_path)) 
-                
-                # 2. To Float Tensor & Channel First: [3, 96, 96]
-                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
-                
-                # 3. GLOBAL SCALING (Fixes the Variance Trap)
-                # Maps [0, 255] -> [-1, 1]
-                img_tensor = (img_tensor / 127.5) - 1.0
-                
-                return img_tensor
-            except Exception as e:
-                return self._generate_synthetic_image()
+        """
+        Load BBBC021 image. 
+        CRASHES if missing (Removed Synthetic Fallback).
+        """
+        # 1. Construct Full Path
+        # Handle cases where extension is missing in CSV
+        base_path = self.data_dir / image_path
+        if base_path.exists():
+            full_path = base_path
+        elif (self.data_dir / (str(image_path) + '.npy')).exists():
+            full_path = self.data_dir / (str(image_path) + '.npy')
         else:
-            return self._generate_synthetic_image()
+            # 2. FILE NOT FOUND - CRASH HERE
+            # This is critical so you can fix the --data-dir path
+            raise FileNotFoundError(
+                f"\n[CRITICAL ERROR] Image not found!\n"
+                f"  Looking for: {base_path}\n"
+                f"  Also tried:  {str(base_path) + '.npy'}\n"
+                f"  Solution: Check your --data-dir argument. The CSV path '{image_path}' must exist relative to it."
+            )
+
+        # 3. Load & Process
+        try:
+            img_array = np.load(str(full_path))
+            
+            # Convert [H, W, C] -> [C, H, W] if needed
+            if img_array.ndim == 3 and img_array.shape[-1] == 3:
+                 img_array = img_array.transpose(2, 0, 1)
+            
+            img_tensor = torch.from_numpy(img_array).float()
+            
+            # Normalize [0, 255] -> [-1, 1]
+            if img_tensor.max() > 1.0:
+                 img_tensor = (img_tensor / 127.5) - 1.0
+                 
+            return img_tensor
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
     
-    def _generate_synthetic_image(self) -> torch.Tensor:
-        """Generate synthetic cell-like image for testing."""
-        # Create random cell-like patterns
-        image = np.random.randn(self.num_channels, self.image_size, self.image_size)
-        
-        # Add cell-like structure
-        y, x = np.ogrid[-self.image_size//2:self.image_size//2, 
-                        -self.image_size//2:self.image_size//2]
-        
-        # Add nucleus (channel 0 - DNA)
-        nucleus_mask = x*x + y*y <= (self.image_size//6)**2
-        image[0][nucleus_mask] += 2.0
-        
-        # Add cytoskeleton patterns (channel 1 - F-actin)
-        image[1] += 0.5 * np.sin(x/5.0) * np.cos(y/5.0)
-        
-        # Add microtubules (channel 2 - β-tubulin)
-        for _ in range(5):
-            angle = np.random.uniform(0, 2*np.pi)
-            cx, cy = np.random.randint(-20, 20, 2)
-            line_mask = np.abs((x-cx)*np.sin(angle) - (y-cy)*np.cos(angle)) < 2
-            image[2][line_mask] += 1.5
-        
-        # Normalize
-        image = (image - image.mean()) / (image.std() + 1e-8)
-        image = np.clip(image, -3, 3) / 3.0
-        
-        return torch.tensor(image, dtype=torch.float32)
+    # DELETE OR COMMENT OUT THIS METHOD
+    # def _generate_synthetic_image(self) -> torch.Tensor:
+    #    """Generate synthetic cell-like image for testing."""
+    #    # Create random cell-like patterns
+    #    image = np.random.randn(self.num_channels, self.image_size, self.image_size)
+    #    
+    #    # Add cell-like structure
+    #    y, x = np.ogrid[-self.image_size//2:self.image_size//2, 
+    #                    -self.image_size//2:self.image_size//2]
+    #    
+    #    # Add nucleus (channel 0 - DNA)
+    #    nucleus_mask = x*x + y*y <= (self.image_size//6)**2
+    #    image[0][nucleus_mask] += 2.0
+    #    
+    #    # Add cytoskeleton patterns (channel 1 - F-actin)
+    #    image[1] += 0.5 * np.sin(x/5.0) * np.cos(y/5.0)
+    #    
+    #    # Add microtubules (channel 2 - β-tubulin)
+    #    for _ in range(5):
+    #        angle = np.random.uniform(0, 2*np.pi)
+    #        cx, cy = np.random.randint(-20, 20, 2)
+    #        line_mask = np.abs((x-cx)*np.sin(angle) - (y-cy)*np.cos(angle)) < 2
+    #        image[2][line_mask] += 1.5
+    #    
+    #    # Normalize
+    #    image = (image - image.mean()) / (image.std() + 1e-8)
+    #    image = np.clip(image, -3, 3) / 3.0
+    #    
+    #    return torch.tensor(image, dtype=torch.float32)
     
     @property
     def num_channels(self) -> int:
@@ -1617,26 +1634,52 @@ class BBBC021DatasetCellFlux(Dataset):
         }
     
     def _load_image(self, image_path: str) -> torch.Tensor:
-        """Load BBBC021 image."""
-        full_path = self.data_dir / image_path
-        
-        if full_path.exists():
-            try:
-                img_array = np.load(str(full_path))
-                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
-                img_tensor = (img_tensor / 127.5) - 1.0
-                return img_tensor
-            except Exception as e:
-                print(f"Warning: Failed to load {full_path}: {e}")
-        
-        # Fallback: synthetic image
-        return self._generate_synthetic_image()
+        """
+        Load BBBC021 image. 
+        CRASHES if missing (Removed Synthetic Fallback).
+        """
+        # 1. Construct Full Path
+        # Handle cases where extension is missing in CSV
+        base_path = self.data_dir / image_path
+        if base_path.exists():
+            full_path = base_path
+        elif (self.data_dir / (str(image_path) + '.npy')).exists():
+            full_path = self.data_dir / (str(image_path) + '.npy')
+        else:
+            # 2. FILE NOT FOUND - CRASH HERE
+            # This is critical so you can fix the --data-dir path
+            raise FileNotFoundError(
+                f"\n[CRITICAL ERROR] Image not found!\n"
+                f"  Looking for: {base_path}\n"
+                f"  Also tried:  {str(base_path) + '.npy'}\n"
+                f"  Solution: Check your --data-dir argument. The CSV path '{image_path}' must exist relative to it."
+            )
+
+        # 3. Load & Process
+        try:
+            img_array = np.load(str(full_path))
+            
+            # Convert [H, W, C] -> [C, H, W] if needed
+            if img_array.ndim == 3 and img_array.shape[-1] == 3:
+                 img_array = img_array.transpose(2, 0, 1)
+            
+            img_tensor = torch.from_numpy(img_array).float()
+            
+            # Normalize [0, 255] -> [-1, 1]
+            if img_tensor.max() > 1.0:
+                 img_tensor = (img_tensor / 127.5) - 1.0
+                 
+            return img_tensor
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
     
-    def _generate_synthetic_image(self) -> torch.Tensor:
-        """Generate synthetic cell image for testing."""
-        image = np.random.randn(3, self.image_size, self.image_size).astype(np.float32)
-        image = np.clip(image, -1, 1)
-        return torch.tensor(image)
+    # DELETE OR COMMENT OUT THIS METHOD
+    # def _generate_synthetic_image(self) -> torch.Tensor:
+    #    """Generate synthetic cell image for testing."""
+    #    image = np.random.randn(3, self.image_size, self.image_size).astype(np.float32)
+    #    image = np.clip(image, -1, 1)
+    #    return torch.tensor(image)
     
     def get_control_indices(self) -> List[int]:
         """Get indices of all control (DMSO) samples."""
