@@ -3451,6 +3451,7 @@ class BBBC021AblationRunner:
         print(f"Device: {config.device}")
         print(f"Train samples: {len(self.train_dataset)}")
         print(f"Val samples: {len(self.val_dataset)}")
+        print(f"Test samples: {len(self.test_dataset)}")
     
     def _load_checkpoint_if_exists(self, model, optimizer, filename, skip_optimizer=False):
         """
