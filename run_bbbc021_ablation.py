@@ -903,44 +903,62 @@ class BBBC021Dataset(Dataset):
     
     def _load_image(self, image_path: str) -> torch.Tensor:
         """
-        Load BBBC021 image. 
-        CRASHES if missing (Removed Synthetic Fallback).
+        Load BBBC021 image with ROBUST NORMALIZATION.
+        Safely handles uint8, uint16, and float inputs to ensure [-1, 1] range.
+        CRASHES if file is missing (No synthetic fallback).
         """
-        # 1. Construct Full Path
-        # Handle cases where extension is missing in CSV
+        # 1. Resolve Path
         base_path = self.data_dir / image_path
+        # Try finding the file with or without extension
         if base_path.exists():
             full_path = base_path
         elif (self.data_dir / (str(image_path) + '.npy')).exists():
             full_path = self.data_dir / (str(image_path) + '.npy')
         else:
-            # 2. FILE NOT FOUND - CRASH HERE
-            # This is critical so you can fix the --data-dir path
+            # CRITICAL FIX: Raise error instead of generating noise
             raise FileNotFoundError(
-                f"\n[CRITICAL ERROR] Image not found!\n"
-                f"  Looking for: {base_path}\n"
-                f"  Also tried:  {str(base_path) + '.npy'}\n"
-                f"  Solution: Check your --data-dir argument. The CSV path '{image_path}' must exist relative to it."
+                f"[CRITICAL] Image not found: {base_path}\n"
+                f"Check --data-dir. The CSV path must exist relative to it."
             )
 
-        # 3. Load & Process
+        # 2. Load and Normalize
         try:
             img_array = np.load(str(full_path))
-            
-            # Convert [H, W, C] -> [C, H, W] if needed
+
+            # Handle Dimensions: Ensure [Channels, Height, Width]
+            # If loaded as [96, 96, 3], transpose to [3, 96, 96]
             if img_array.ndim == 3 and img_array.shape[-1] == 3:
                  img_array = img_array.transpose(2, 0, 1)
+
+            # --- SMART NORMALIZATION ---
+            # Detect data type to apply correct scaling to [-1, 1]
             
-            img_tensor = torch.from_numpy(img_array).float()
+            # Case A: 8-bit Integer (0 to 255) -> Standard
+            if img_array.dtype == np.uint8:
+                img_tensor = torch.from_numpy(img_array).float()
+                img_tensor = (img_tensor / 127.5) - 1.0
             
-            # Normalize [0, 255] -> [-1, 1]
-            if img_tensor.max() > 1.0:
-                 img_tensor = (img_tensor / 127.5) - 1.0
-                 
+            # Case B: 16-bit Integer (0 to 65535) -> Microscopy Standard
+            elif img_array.dtype == np.uint16:
+                img_tensor = torch.from_numpy(img_array).float()
+                img_tensor = (img_tensor / 32767.5) - 1.0
+                
+            # Case C: Floating Point (Assume 0.0 to 1.0 or -1.0 to 1.0)
+            else:
+                img_tensor = torch.from_numpy(img_array).float()
+                # If range is [0, 1], map to [-1, 1]
+                if img_tensor.min() >= 0.0 and img_tensor.max() <= 1.05:
+                    img_tensor = (img_tensor * 2.0) - 1.0
+                # If range is already [-1, 1], do nothing
+                
+            # 3. Final Safety Clip
+            # Ensure no values exceed [-1, 1] (prevents gradient explosions)
+            img_tensor = torch.clamp(img_tensor, -1.0, 1.0)
+
             return img_tensor
-            
+
         except Exception as e:
-            raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
+            raise RuntimeError(f"Failed to load image at {full_path}: {e}")
     
     # REMOVED: Synthetic fallback removed to force proper path resolution
     # def _generate_synthetic_image(self) -> torch.Tensor:
@@ -1641,44 +1659,62 @@ class BBBC021DatasetCellFlux(Dataset):
     
     def _load_image(self, image_path: str) -> torch.Tensor:
         """
-        Load BBBC021 image. 
-        CRASHES if missing (Removed Synthetic Fallback).
+        Load BBBC021 image with ROBUST NORMALIZATION.
+        Safely handles uint8, uint16, and float inputs to ensure [-1, 1] range.
+        CRASHES if file is missing (No synthetic fallback).
         """
-        # 1. Construct Full Path
-        # Handle cases where extension is missing in CSV
+        # 1. Resolve Path
         base_path = self.data_dir / image_path
+        # Try finding the file with or without extension
         if base_path.exists():
             full_path = base_path
         elif (self.data_dir / (str(image_path) + '.npy')).exists():
             full_path = self.data_dir / (str(image_path) + '.npy')
         else:
-            # 2. FILE NOT FOUND - CRASH HERE
-            # This is critical so you can fix the --data-dir path
+            # CRITICAL FIX: Raise error instead of generating noise
             raise FileNotFoundError(
-                f"\n[CRITICAL ERROR] Image not found!\n"
-                f"  Looking for: {base_path}\n"
-                f"  Also tried:  {str(base_path) + '.npy'}\n"
-                f"  Solution: Check your --data-dir argument. The CSV path '{image_path}' must exist relative to it."
+                f"[CRITICAL] Image not found: {base_path}\n"
+                f"Check --data-dir. The CSV path must exist relative to it."
             )
 
-        # 3. Load & Process
+        # 2. Load and Normalize
         try:
             img_array = np.load(str(full_path))
-            
-            # Convert [H, W, C] -> [C, H, W] if needed
+
+            # Handle Dimensions: Ensure [Channels, Height, Width]
+            # If loaded as [96, 96, 3], transpose to [3, 96, 96]
             if img_array.ndim == 3 and img_array.shape[-1] == 3:
                  img_array = img_array.transpose(2, 0, 1)
+
+            # --- SMART NORMALIZATION ---
+            # Detect data type to apply correct scaling to [-1, 1]
             
-            img_tensor = torch.from_numpy(img_array).float()
+            # Case A: 8-bit Integer (0 to 255) -> Standard
+            if img_array.dtype == np.uint8:
+                img_tensor = torch.from_numpy(img_array).float()
+                img_tensor = (img_tensor / 127.5) - 1.0
             
-            # Normalize [0, 255] -> [-1, 1]
-            if img_tensor.max() > 1.0:
-                 img_tensor = (img_tensor / 127.5) - 1.0
-                 
+            # Case B: 16-bit Integer (0 to 65535) -> Microscopy Standard
+            elif img_array.dtype == np.uint16:
+                img_tensor = torch.from_numpy(img_array).float()
+                img_tensor = (img_tensor / 32767.5) - 1.0
+                
+            # Case C: Floating Point (Assume 0.0 to 1.0 or -1.0 to 1.0)
+            else:
+                img_tensor = torch.from_numpy(img_array).float()
+                # If range is [0, 1], map to [-1, 1]
+                if img_tensor.min() >= 0.0 and img_tensor.max() <= 1.05:
+                    img_tensor = (img_tensor * 2.0) - 1.0
+                # If range is already [-1, 1], do nothing
+                
+            # 3. Final Safety Clip
+            # Ensure no values exceed [-1, 1] (prevents gradient explosions)
+            img_tensor = torch.clamp(img_tensor, -1.0, 1.0)
+
             return img_tensor
-            
+
         except Exception as e:
-            raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
+            raise RuntimeError(f"Failed to load image at {full_path}: {e}")
     
     # REMOVED: Synthetic fallback removed to force proper path resolution
     # def _generate_synthetic_image(self) -> torch.Tensor:
