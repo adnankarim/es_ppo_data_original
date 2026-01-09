@@ -939,35 +939,35 @@ class BBBC021Dataset(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
     
-    # DELETE OR COMMENT OUT THIS METHOD
+    # REMOVED: Synthetic fallback removed to force proper path resolution
     # def _generate_synthetic_image(self) -> torch.Tensor:
-    #    """Generate synthetic cell-like image for testing."""
-    #    # Create random cell-like patterns
-    #    image = np.random.randn(self.num_channels, self.image_size, self.image_size)
-    #    
-    #    # Add cell-like structure
-    #    y, x = np.ogrid[-self.image_size//2:self.image_size//2, 
-    #                    -self.image_size//2:self.image_size//2]
-    #    
-    #    # Add nucleus (channel 0 - DNA)
-    #    nucleus_mask = x*x + y*y <= (self.image_size//6)**2
-    #    image[0][nucleus_mask] += 2.0
-    #    
-    #    # Add cytoskeleton patterns (channel 1 - F-actin)
-    #    image[1] += 0.5 * np.sin(x/5.0) * np.cos(y/5.0)
-    #    
-    #    # Add microtubules (channel 2 - β-tubulin)
-    #    for _ in range(5):
-    #        angle = np.random.uniform(0, 2*np.pi)
-    #        cx, cy = np.random.randint(-20, 20, 2)
-    #        line_mask = np.abs((x-cx)*np.sin(angle) - (y-cy)*np.cos(angle)) < 2
-    #        image[2][line_mask] += 1.5
-    #    
-    #    # Normalize
-    #    image = (image - image.mean()) / (image.std() + 1e-8)
-    #    image = np.clip(image, -3, 3) / 3.0
-    #    
-    #    return torch.tensor(image, dtype=torch.float32)
+    #     """Generate synthetic cell-like image for testing."""
+    #     # Create random cell-like patterns
+    #     image = np.random.randn(self.num_channels, self.image_size, self.image_size)
+    #     
+    #     # Add cell-like structure
+    #     y, x = np.ogrid[-self.image_size//2:self.image_size//2, 
+    #                     -self.image_size//2:self.image_size//2]
+    #     
+    #     # Add nucleus (channel 0 - DNA)
+    #     nucleus_mask = x*x + y*y <= (self.image_size//6)**2
+    #     image[0][nucleus_mask] += 2.0
+    #     
+    #     # Add cytoskeleton patterns (channel 1 - F-actin)
+    #     image[1] += 0.5 * np.sin(x/5.0) * np.cos(y/5.0)
+    #     
+    #     # Add microtubules (channel 2 - β-tubulin)
+    #     for _ in range(5):
+    #         angle = np.random.uniform(0, 2*np.pi)
+    #         cx, cy = np.random.randint(-20, 20, 2)
+    #         line_mask = np.abs((x-cx)*np.sin(angle) - (y-cy)*np.cos(angle)) < 2
+    #         image[2][line_mask] += 1.5
+    #     
+    #     # Normalize
+    #     image = (image - image.mean()) / (image.std() + 1e-8)
+    #     image = np.clip(image, -3, 3) / 3.0
+    #     
+    #     return torch.tensor(image, dtype=torch.float32)
     
     @property
     def num_channels(self) -> int:
@@ -1674,12 +1674,12 @@ class BBBC021DatasetCellFlux(Dataset):
         except Exception as e:
             raise RuntimeError(f"Failed to load valid numpy file at {full_path}: {e}")
     
-    # DELETE OR COMMENT OUT THIS METHOD
+    # REMOVED: Synthetic fallback removed to force proper path resolution
     # def _generate_synthetic_image(self) -> torch.Tensor:
-    #    """Generate synthetic cell image for testing."""
-    #    image = np.random.randn(3, self.image_size, self.image_size).astype(np.float32)
-    #    image = np.clip(image, -1, 1)
-    #    return torch.tensor(image)
+    #     """Generate synthetic cell image for testing."""
+    #     image = np.random.randn(3, self.image_size, self.image_size).astype(np.float32)
+    #     image = np.clip(image, -1, 1)
+    #     return torch.tensor(image)
     
     def get_control_indices(self) -> List[int]:
         """Get indices of all control (DMSO) samples."""
