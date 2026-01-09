@@ -3415,13 +3415,13 @@ class BBBC021AblationRunner:
             print(f"  Saved splits to: {temp_dir}")
             
             # 3. Load datasets - PASS THE ABSOLUTE PATHS
-        self.train_dataset = BBBC021Dataset(
+            self.train_dataset = BBBC021Dataset(
                 config.data_dir, train_csv_path,  # Passing absolute path
                 config.image_size, split="train",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
-        )
-        self.val_dataset = BBBC021Dataset(
+            )
+            self.val_dataset = BBBC021Dataset(
                 config.data_dir, val_csv_path,
                 config.image_size, split="val",
                 morgan_encoder=self.chem_encoder,
@@ -3432,7 +3432,7 @@ class BBBC021AblationRunner:
                 config.image_size, split="test",
                 morgan_encoder=self.chem_encoder,
                 exclude_ood=False
-        )
+            )
         
         # Initialize wandb
         if config.use_wandb and WANDB_AVAILABLE:
@@ -3502,7 +3502,7 @@ class BBBC021AblationRunner:
             # 3. Load Optimizer (if applicable)
             if optimizer and 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None and not skip_optimizer:
                 try:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                 except ValueError:
                     print("  Warning: Optimizer param groups mismatch. Skipping optimizer load.")
             elif skip_optimizer:
