@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 import csv
 import numpy as np
@@ -55,39 +56,93 @@ class BBBC021VizDataset:
     def __len__(self):
         return len(self.metadata)
 
-    def _smart_find_file(self, filename):
+    def _parse_week_plate_from_filename(self, filename):
+        """Extract week and plate from filename like 'Week3_25461_3_628_89.0.npy'."""
+        # Pattern: Week{number}_{plate}_{rest}
+        match = re.match(r'Week(\d+)_(\d+)_(.+)', filename)
+        if match:
+            week_num = match.group(1)
+            plate_num = match.group(2)
+            stripped_name = match.group(3)  # The part after Week{num}_{plate}_
+            return f"Week{week_num}", plate_num, stripped_name
+        return None, None, None
+
+    def _smart_find_file(self, filename, verbose=False):
         """
         Aggressively searches for the file if standard paths fail.
+        Handles both full filenames and stripped versions in nested directories.
         """
         # 1. Check Cache
         if filename in self.path_cache:
             return self.path_cache[filename]
 
-        # 2. Check Direct Path
+        # 2. Parse week/plate and strip prefix if present
+        week, plate, stripped_name = self._parse_week_plate_from_filename(filename)
+        
+        if verbose:
+            print(f"    Parsing '{filename}': week={week}, plate={plate}, stripped={stripped_name}")
+        
+        # 3. Try nested path with stripped filename (MOST LIKELY)
+        # Files are at: Week1/22123/1_94_31.0.npy
+        if week and plate and stripped_name:
+            nested_path = self.data_dir / week / plate / stripped_name
+            if verbose:
+                print(f"    Trying: {nested_path}")
+            if nested_path.exists():
+                self.path_cache[filename] = nested_path
+                return nested_path
+
+        # 4. Try nested path with full filename
+        if week and plate:
+            nested_path_full = self.data_dir / week / plate / filename
+            if verbose:
+                print(f"    Trying: {nested_path_full}")
+            if nested_path_full.exists():
+                self.path_cache[filename] = nested_path_full
+                return nested_path_full
+
+        # 5. Check Direct Path
         direct_path = self.data_dir / filename
+        if verbose:
+            print(f"    Trying: {direct_path}")
         if direct_path.exists():
             self.path_cache[filename] = direct_path
             return direct_path
 
-        # 3. Recursive Search (The "Nuclear Option")
-        # Looks for the filename in ANY subfolder of data_dir
-        # This fixes 99% of "path mismatch" errors.
-        # print(f"  Searching for {filename} in {self.data_dir}...")
+        # 6. Recursive Search for full filename (The "Nuclear Option")
+        if verbose:
+            print(f"    Recursively searching for: {filename}")
         matches = list(self.data_dir.rglob(filename))
-        
         if matches:
-            # Found it! Cache the parent dir to speed up future lookups
             found_path = matches[0]
+            if verbose:
+                print(f"    Found via recursive search: {found_path}")
             self.path_cache[filename] = found_path
             return found_path
+
+        # 7. Recursive Search for stripped filename (if we have it)
+        if stripped_name:
+            if verbose:
+                print(f"    Recursively searching for stripped: {stripped_name}")
+            matches_stripped = list(self.data_dir.rglob(stripped_name))
+            if matches_stripped:
+                found_path = matches_stripped[0]
+                if verbose:
+                    print(f"    Found stripped via recursive search: {found_path}")
+                self.path_cache[filename] = found_path
+                return found_path
             
+        if verbose:
+            print(f"    All search attempts failed for: {filename}")
         return None
 
     def __getitem__(self, idx):
         meta = self.metadata[idx]
         filename = meta['filename']
         
-        full_path = self._smart_find_file(filename)
+        # Use verbose mode for first few samples to debug
+        verbose = (idx < 3)
+        full_path = self._smart_find_file(filename, verbose=verbose)
         
         if full_path is None:
             return None, meta, f"Missing: {filename}"
