@@ -938,7 +938,7 @@ class BBBC021Dataset(Dataset):
                 nested_path = self.data_dir / f"Week{week}" / plate / f"{filename}.npy"
                 if nested_path.exists():
                     full_path = nested_path
-        else:
+                else:
                     # Also try without .npy extension in filename
                     nested_path_no_ext = self.data_dir / f"Week{week}" / plate / filename
                     if nested_path_no_ext.exists():
