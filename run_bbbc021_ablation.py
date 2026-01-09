@@ -2301,6 +2301,9 @@ class ImageDDPM:
         
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).to(self.device)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod).to(self.device)
+        
+        # Flag to show subsampling warning only once per model instance
+        self._subsampling_warning_shown = False
     
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
         """Forward diffusion: q(x_t | x_0)"""
@@ -2428,14 +2431,16 @@ class ImageDDPM:
         # CRITICAL: Naive subsampling (num_steps < timesteps) is mathematically incorrect for DDPM
         # For valid scientific results, use num_steps == timesteps (1000 steps)
         # If you must use fewer steps, implement proper DDIM sampler instead
-        if num_steps < self.timesteps:
+        if num_steps < self.timesteps and not self._subsampling_warning_shown:
             import warnings
             warnings.warn(
                 f"[SCIENTIFIC WARNING] Using {num_steps} steps instead of {self.timesteps} is naive subsampling. "
                 f"This is NOT mathematically correct for DDPM and may produce noisy/blurry results. "
-                f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler.",
+                f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler. "
+                f"(This warning will only show once per model instance.)",
                 UserWarning
             )
+            self._subsampling_warning_shown = True
         
         step_size = self.timesteps // num_steps
         
@@ -6145,6 +6150,9 @@ def main():
                        help="DDPM learning rate (reduced for better convergence)")
     parser.add_argument("--coupling-batch-size", type=int, default=512,
                        help="Coupling batch size")
+    parser.add_argument("--num-sampling-steps", type=int, default=50,
+                       help="Number of sampling steps for inference (default: 50 for speed, 1000 for valid FID). "
+                            "Warning: Using <1000 steps is naive subsampling and may produce invalid FID scores.")
     
     # ES ablation
     parser.add_argument("--es-sigma-values", type=float, nargs='+',
