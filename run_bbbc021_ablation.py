@@ -649,9 +649,10 @@ class BBBC021Dataset(Dataset):
             metadata_path = self.data_dir / metadata_file
         
         if not metadata_path.exists():
-            print(f"Warning: Metadata file not found at {metadata_path}")
-            print("Generating synthetic metadata for testing...")
-            return self._generate_synthetic_metadata()
+            raise FileNotFoundError(
+                f"[CRITICAL] Metadata CSV not found at: {metadata_path}\n"
+                f"  Solution: Check your --metadata-file argument. The file must exist."
+            )
         
         # CellFlux OOD Compound List
         ood_compounds = {
@@ -770,54 +771,55 @@ class BBBC021Dataset(Dataset):
 
         return metadata
     
-    def _generate_synthetic_metadata(self) -> List[Dict]:
-        """Generate synthetic metadata for testing without real data."""
-        compounds = ['DMSO', 'Taxol', 'Colchicine', 'Nocodazole', 'Cytochalasin_B',
-                    'Vincristine', 'Demecolcine', 'Alsterpaullone', 'AZ138', 'PP-2']
-        moa_classes = ['Control', 'Microtubule_stabilizers', 'Microtubule_destabilizers',
-                      'Actin_disruptors', 'Kinase_inhibitors', 'Eg5_inhibitors', 'Epithelial']
-        
-        compound_to_moa = {
-            'DMSO': 'Control',
-            'Taxol': 'Microtubule_stabilizers',
-            'Colchicine': 'Microtubule_destabilizers',
-            'Nocodazole': 'Microtubule_destabilizers',
-            'Cytochalasin_B': 'Actin_disruptors',
-            'Vincristine': 'Microtubule_destabilizers',
-            'Demecolcine': 'Microtubule_destabilizers',
-            'Alsterpaullone': 'Kinase_inhibitors',
-            'AZ138': 'Eg5_inhibitors',
-            'PP-2': 'Epithelial',
-        }
-        
-        metadata = []
-        n_samples = 5000  # Smaller for testing
-        n_batches = 10
-        
-        for i in range(n_samples):
-            compound = compounds[i % len(compounds)]
-            batch = f"batch_{i % n_batches}"
-            metadata.append({
-                'image_path': f'synthetic_{i}.png',
-                'compound': compound,
-                'concentration': 1.0,
-                'moa': compound_to_moa.get(compound, 'Unknown'),
-                'batch': batch,
-                'well': f'well_{i}',
-                'is_control': compound == 'DMSO',
-                'smiles': '',  # Synthetic
-            })
-        
-        # Split data
-        n_train = int(0.7 * len(metadata))
-        n_val = int(0.15 * len(metadata))
-        
-        if self.split == "train":
-            return metadata[:n_train]
-        elif self.split == "val":
-            return metadata[n_train:n_train + n_val]
-        else:  # test
-            return metadata[n_train + n_val:]
+    # REMOVED: Synthetic metadata fallback removed to force proper CSV path resolution
+    # def _generate_synthetic_metadata(self) -> List[Dict]:
+    #     """Generate synthetic metadata for testing without real data."""
+    #     compounds = ['DMSO', 'Taxol', 'Colchicine', 'Nocodazole', 'Cytochalasin_B',
+    #                 'Vincristine', 'Demecolcine', 'Alsterpaullone', 'AZ138', 'PP-2']
+    #     moa_classes = ['Control', 'Microtubule_stabilizers', 'Microtubule_destabilizers',
+    #                   'Actin_disruptors', 'Kinase_inhibitors', 'Eg5_inhibitors', 'Epithelial']
+    #     
+    #     compound_to_moa = {
+    #         'DMSO': 'Control',
+    #         'Taxol': 'Microtubule_stabilizers',
+    #         'Colchicine': 'Microtubule_destabilizers',
+    #         'Nocodazole': 'Microtubule_destabilizers',
+    #         'Cytochalasin_B': 'Actin_disruptors',
+    #         'Vincristine': 'Microtubule_destabilizers',
+    #         'Demecolcine': 'Microtubule_destabilizers',
+    #         'Alsterpaullone': 'Kinase_inhibitors',
+    #         'AZ138': 'Eg5_inhibitors',
+    #         'PP-2': 'Epithelial',
+    #     }
+    #     
+    #     metadata = []
+    #     n_samples = 5000  # Smaller for testing
+    #     n_batches = 10
+    #     
+    #     for i in range(n_samples):
+    #         compound = compounds[i % len(compounds)]
+    #         batch = f"batch_{i % n_batches}"
+    #         metadata.append({
+    #             'image_path': f'synthetic_{i}.png',
+    #             'compound': compound,
+    #             'concentration': 1.0,
+    #             'moa': compound_to_moa.get(compound, 'Unknown'),
+    #             'batch': batch,
+    #             'well': f'well_{i}',
+    #             'is_control': compound == 'DMSO',
+    #             'smiles': '',  # Synthetic
+    #         })
+    #     
+    #     # Split data
+    #     n_train = int(0.7 * len(metadata))
+    #     n_val = int(0.15 * len(metadata))
+    #     
+    #     if self.split == "train":
+    #         return metadata[:n_train]
+    #     elif self.split == "val":
+    #         return metadata[n_train:n_train + n_val]
+    #     else:  # test
+    #         return metadata[n_train + n_val:]
     
     def _group_by_batch(self) -> Dict[str, List[int]]:
         """Group sample indices by batch for batch-aware sampling."""
@@ -872,12 +874,13 @@ class BBBC021Dataset(Dataset):
         # CRITICAL FIX: Look up the precomputed CPU tensor instead of calling the GPU encoder
         # This prevents the forked worker from needing to talk to the GPU.
         compound = meta['compound']
-        if compound in self.fingerprints:
-            fingerprint = self.fingerprints[compound]
-        else:
-            # Fallback if specific compound wasn't pre-encoded
-            embed_dim = getattr(self.chem_encoder, 'embed_dim', 768)
-            fingerprint = self.fingerprints.get('DMSO', np.zeros(embed_dim))
+        if compound not in self.fingerprints:
+            raise ValueError(
+                f"[CRITICAL] No fingerprint found for compound: '{compound}'. "
+                f"Check spelling in CSV vs Encoder. Available compounds: {list(self.fingerprints.keys())[:10]}..."
+            )
+        
+        fingerprint = self.fingerprints[compound]
         
         # Ensure it's a tensor (if stored as numpy)
         if not isinstance(fingerprint, torch.Tensor):
@@ -990,8 +993,10 @@ class BBBC021Dataset(Dataset):
         control_indices = [i for i in batch_indices if self.metadata[i]['is_control']]
         
         if not control_indices:
-            # Fallback: use any control
-            control_indices = self.get_control_indices()
+            raise RuntimeError(
+                f"[CRITICAL] Batch '{batch}' has NO control (DMSO) images. "
+                f"Cannot perform batch-correction. Remove this batch from CSV or add control samples."
+            )
         
         control_idx = np.random.choice(control_indices)
         return control_idx, perturbed_idx
@@ -1608,12 +1613,13 @@ class BBBC021DatasetCellFlux(Dataset):
         # CRITICAL FIX: Look up the precomputed CPU tensor instead of calling the GPU encoder
         # This prevents the forked worker from needing to talk to the GPU.
         compound = meta['compound']
-        if compound in self.fingerprints:
-            fingerprint = self.fingerprints[compound]
-        else:
-            # Fallback if specific compound wasn't pre-encoded
-            embed_dim = getattr(self.chem_encoder, 'embed_dim', 768)
-            fingerprint = self.fingerprints.get('DMSO', np.zeros(embed_dim))
+        if compound not in self.fingerprints:
+            raise ValueError(
+                f"[CRITICAL] No fingerprint found for compound: '{compound}'. "
+                f"Check spelling in CSV vs Encoder. Available compounds: {list(self.fingerprints.keys())[:10]}..."
+            )
+        
+        fingerprint = self.fingerprints[compound]
         
         # Ensure it's a tensor (if stored as numpy)
         if not isinstance(fingerprint, torch.Tensor):
@@ -1694,16 +1700,13 @@ class BBBC021DatasetCellFlux(Dataset):
         batch = self.metadata[perturbed_idx]['batch']
         ctrl_indices_same_batch = self.batch_to_ctrl_indices.get(batch, [])
         
-        if ctrl_indices_same_batch:
-            control_idx = np.random.choice(ctrl_indices_same_batch)
-        else:
-            all_ctrl = self.get_control_indices()
-            if all_ctrl:
-                control_idx = np.random.choice(all_ctrl)
-                print(f"WARNING: No controls in batch '{batch}', using random control")
-            else:
-                raise ValueError(f"No control samples available!")
+        if not ctrl_indices_same_batch:
+            raise RuntimeError(
+                f"[CRITICAL] Batch '{batch}' has NO control (DMSO) images. "
+                f"Cannot perform batch-correction. Remove this batch from CSV or add control samples."
+            )
         
+        control_idx = np.random.choice(ctrl_indices_same_batch)
         return control_idx, perturbed_idx
 
 
@@ -2266,6 +2269,18 @@ class ImageDDPM:
             uncond_emb = None
         
         # Reverse diffusion
+        # CRITICAL: Naive subsampling (num_steps < timesteps) is mathematically incorrect for DDPM
+        # For valid scientific results, use num_steps == timesteps (1000 steps)
+        # If you must use fewer steps, implement proper DDIM sampler instead
+        if num_steps < self.timesteps:
+            import warnings
+            warnings.warn(
+                f"[SCIENTIFIC WARNING] Using {num_steps} steps instead of {self.timesteps} is naive subsampling. "
+                f"This is NOT mathematically correct for DDPM and may produce noisy/blurry results. "
+                f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler.",
+                UserWarning
+            )
+        
         step_size = self.timesteps // num_steps
         
         for i in reversed(range(0, self.timesteps, step_size)):
@@ -2662,10 +2677,10 @@ class ImageMetrics:
         # 1. Move numpy -> tensor on Aux Device
         images_t = torch.tensor(images).float().to(self.device)
         
-        # 2. Normalize to [0, 1] Range
-        # If images are [-1, 1] (standard DDPM output), map to [0, 1]
-        if images_t.min() < 0:
-            images_t = (images_t + 1.0) / 2.0
+        # 2. CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
+        # Remove auto-detection to prevent inconsistent normalization between real/fake images
+        # The loader normalizes to [-1, 1] via: (img / 127.5) - 1.0
+        images_t = (images_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
         images_t = torch.clamp(images_t, 0.0, 1.0)
         
         features = []
@@ -2722,6 +2737,64 @@ class ImageMetrics:
         tr_covmean = np.trace(covmean)
         return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
 
+    def compute_conditional_fid(self, real_features, fake_features, labels):
+        """
+        Computes the average FID across all classes (compounds).
+        
+        This is Conditional FID (FID_c): measures if generated images match
+        the biological instruction (drug label) by computing FID per-compound
+        and averaging.
+        
+        Args:
+            real_features: (N, 2048) numpy array or torch.Tensor of real image features
+            fake_features: (N, 2048) numpy array or torch.Tensor of fake image features
+            labels: (N,) numpy array of compound names or indices
+            
+        Returns:
+            avg_fid: The mean FID across all valid classes (Conditional FID)
+            class_fids: Dictionary of {label: fid_score} for per-compound breakdown
+        """
+        # Convert to numpy if tensors
+        if isinstance(real_features, torch.Tensor):
+            real_features = real_features.cpu().numpy()
+        if isinstance(fake_features, torch.Tensor):
+            fake_features = fake_features.cpu().numpy()
+        if isinstance(labels, torch.Tensor):
+            labels = labels.cpu().numpy()
+        
+        unique_labels = np.unique(labels)
+        fids = []
+        class_fids = {}
+
+        for label in unique_labels:
+            # Filter features by class
+            indices = np.where(labels == label)[0]
+            
+            # FID is unstable for very small batches. 
+            # Skip classes with fewer than 10 samples for stability.
+            if len(indices) < 10:
+                continue
+                
+            real_subset = real_features[indices]
+            fake_subset = fake_features[indices]
+            
+            # Compute FID for this compound using existing methods
+            try:
+                mu1, sigma1 = self._compute_stats(real_subset)
+                mu2, sigma2 = self._compute_stats(fake_subset)
+                fid = self._calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+                
+                fids.append(fid)
+                class_fids[label] = fid
+            except Exception as e:
+                # Skip compounds that fail (e.g., too few samples for covariance, numerical issues)
+                continue
+
+        if not fids:
+            return 0.0, {}
+            
+        return np.mean(fids), class_fids
+
     @torch.no_grad()
     def compute_kid(self, real_images: np.ndarray, fake_images: np.ndarray) -> float:
         """
@@ -2738,10 +2811,11 @@ class ImageMetrics:
         real_t = torch.tensor(real_images).float().to(self.device)
         fake_t = torch.tensor(fake_images).float().to(self.device)
         
-        # Normalize to [0, 1] for torchmetrics standard update
-        if real_t.min() < 0:
-            real_t = (real_t + 1.0) / 2.0
-            fake_t = (fake_t + 1.0) / 2.0
+        # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
+        # Remove auto-detection to prevent inconsistent normalization between real/fake images
+        # The loader normalizes to [-1, 1] via: (img / 127.5) - 1.0
+        real_t = (real_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        fake_t = (fake_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
             
         real_t = torch.clamp(real_t, 0, 1)
         fake_t = torch.clamp(fake_t, 0, 1)
@@ -2882,9 +2956,10 @@ class ImageMetrics:
         real_t = torch.tensor(real_images).float().to(device)
         fake_t = torch.tensor(fake_images).float().to(device)
         
-        if real_t.min() < 0:
-            real_t = (real_t + 1.0) / 2.0
-            fake_t = (fake_t + 1.0) / 2.0
+        # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
+        # Remove auto-detection to prevent inconsistent normalization between real/fake images
+        real_t = (real_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        fake_t = (fake_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
             
         real_t = torch.clamp(real_t, 0.0, 1.0)
         fake_t = torch.clamp(fake_t, 0.0, 1.0)
@@ -3103,8 +3178,45 @@ class BBBC021AblationRunner:
             print("\n=== MODE: SOTA Beater (Held-out Batch Validation) ===")
             print("  Strategy: Legitimate tuning (reports Best Epoch on unseen batches)")
             
-            # 1. Generate the Splits
-            train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, val_size=0.15, seed=config.seed)
+            # 1. CRITICAL: Use deterministic splits to prevent data leakage
+            # Save splits to fixed location based on seed for reproducibility
+            splits_dir = os.path.abspath(os.path.join(self.output_dir, "fixed_splits"))
+            os.makedirs(splits_dir, exist_ok=True)
+            
+            # Create deterministic filename based on seed and data hash
+            import hashlib
+            data_hash = hashlib.md5(str(full_df["BATCH"].unique()).encode()).hexdigest()[:8]
+            splits_file = os.path.join(splits_dir, f"splits_seed{config.seed}_{data_hash}.json")
+            
+            # Try to load existing splits
+            if os.path.exists(splits_file):
+                print(f"[Split] Loading existing deterministic splits from: {splits_file}")
+                import json
+                with open(splits_file, 'r') as f:
+                    split_data = json.load(f)
+                train_df = full_df[full_df.index.isin(split_data['train_indices'])].copy()
+                val_df = full_df[full_df.index.isin(split_data['val_indices'])].copy()
+                test_df = full_df[full_df.index.isin(split_data['test_indices'])].copy()
+                split_info = split_data['info']
+            else:
+                # Generate new splits
+                print(f"[Split] Generating new deterministic splits (seed={config.seed})...")
+                train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, val_size=0.15, seed=config.seed)
+                
+                # Save splits for future runs
+                split_data = {
+                    'train_indices': train_df.index.tolist(),
+                    'val_indices': val_df.index.tolist(),
+                    'test_indices': test_df.index.tolist(),
+                    'info': split_info,
+                    'seed': config.seed,
+                    'data_hash': data_hash
+                }
+                import json
+                with open(splits_file, 'w') as f:
+                    json.dump(split_data, f, indent=2)
+                print(f"[Split] Saved deterministic splits to: {splits_file}")
+            
             print("\n=== Batch-Aware Split Summary ===")
             
             # Print split summary
@@ -3122,7 +3234,7 @@ class BBBC021AblationRunner:
                 print("✓ TRAIN and VAL batches are disjoint (no leakage)")
             print("=" * 40 + "\n")
             
-            # 2. Save splits as temporary CSVs (Absolute Paths recommended to avoid confusion)
+            # 2. Save splits as CSVs for dataset loading (Absolute Paths recommended to avoid confusion)
             temp_dir = os.path.abspath(os.path.join(self.output_dir, "temp_splits"))
             os.makedirs(temp_dir, exist_ok=True)
             
@@ -4282,42 +4394,38 @@ class BBBC021AblationRunner:
         ssim = ImageMetrics.compute_ssim(real_imgs, fake_imgs)
         
         # B. Conditional Metrics (FID_c and KID_c) - Per-Compound Average
+        # Conditional FID: "Does the generated 'Taxol' image actually look like a real 'Taxol' image?"
         fid_conditional = 0.0
+        per_class_fids = {}
         kid_conditional = 0.0
+        
         if len(compounds) > 0 and len(np.unique(compounds)) > 1:
+            # Use the dedicated method for Conditional FID
+            print("  Computing Conditional FID (per-compound average)...")
+            fid_conditional, per_class_fids = metrics_engine.compute_conditional_fid(
+                real_feats, fake_feats, compounds
+            )
+            
+            # Also compute Conditional KID (more robust for small N)
             unique_cmps = np.unique(compounds)
-            fids_c = []
             kids_c = []
             for cmp in unique_cmps:
-                # Get indices for this compound
                 idxs = np.where(compounds == cmp)[0]
-                if len(idxs) < 8:
-                    continue  # Need minimum samples for stable stats (8 vs 10 for speed)
-
-                # Compute FID using pre-computed features
-                r_sub = real_feats[idxs]
-                f_sub = fake_feats[idxs]
+                if len(idxs) < 10:  # Same threshold as FID
+                    continue
                 r_img_sub = real_imgs[idxs]
                 f_img_sub = fake_imgs[idxs]
-
-                try:
-                    fid_val = metrics_engine.compute_fid_from_features(r_sub, f_sub)
-                    fids_c.append(fid_val)
-                except Exception:
-                    # Skip compounds that fail (e.g., too few samples for covariance)
-                    pass
-
-                # Compute KID (more robust than FID for small N)
                 try:
                     kid_val = metrics_engine.compute_kid(r_img_sub, f_img_sub)
                     kids_c.append(kid_val)
                 except Exception:
                     pass
-
-            fid_conditional = np.mean(fids_c) if fids_c else 0.0
+            
             kid_conditional = np.mean(kids_c) if kids_c else 0.0
-            if len(fids_c) > 0:
-                print(f"    Conditional mFID: {fid_conditional:.2f} | mKID: {kid_conditional:.2f} (avg over {len(fids_c)} compounds)")
+            
+            if len(per_class_fids) > 0:
+                print(f"    Overall FID (FID_o): {fid_overall:.2f} | Conditional FID (FID_c): {fid_conditional:.2f} (avg over {len(per_class_fids)} compounds)")
+                print(f"    Overall KID (KID_o): {kid_overall:.2f} | Conditional KID (KID_c): {kid_conditional:.2f}")
         
         # C. Deep MoA Accuracy (Using Inception Features)
         moa_acc = 0.0
@@ -4334,10 +4442,11 @@ class BBBC021AblationRunner:
         info_metrics = ApproximateMetrics.compute_all(real_imgs, fake_imgs)
 
         metrics = {
-            'fid': fid_overall,                    # Overall FID (Global quality)
-            'fid_conditional': fid_conditional,    # Conditional mFID (Per-compound consistency)
-            'kid': kid_overall,                    # Overall KID (Global unbiased)
-            'kid_conditional': kid_conditional,    # Conditional mKID (Per-compound unbiased)
+            'fid': fid_overall,                    # Overall FID (FID_o): Global quality/diversity
+            'fid_conditional': fid_conditional,    # Conditional FID (FID_c): Per-compound consistency
+            'fid_per_class': per_class_fids,        # Per-compound FID breakdown (for analysis)
+            'kid': kid_overall,                    # Overall KID (KID_o): Global unbiased metric
+            'kid_conditional': kid_conditional,    # Conditional KID (KID_c): Per-compound unbiased
             'moa_accuracy': moa_acc,               # Deep MoA Accuracy
             'pixel_change': pixel_change,
             'mse': mse,
