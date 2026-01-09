@@ -2192,6 +2192,9 @@ class EMA:
 class ImageDDPM:
     """DDPM for image generation with U-Net or U-ViT Transformer backbone."""
     
+    # Class-level flag to suppress subsampling warning globally
+    _suppress_subsampling_warning = False
+    
     def __init__(
         self,
         image_size: int = 96,
@@ -2432,14 +2435,16 @@ class ImageDDPM:
         # For valid scientific results, use num_steps == timesteps (1000 steps)
         # If you must use fewer steps, implement proper DDIM sampler instead
         if num_steps < self.timesteps and not self._subsampling_warning_shown:
+            # Check if warnings are suppressed via global flag
             import warnings
-            warnings.warn(
-                f"[SCIENTIFIC WARNING] Using {num_steps} steps instead of {self.timesteps} is naive subsampling. "
-                f"This is NOT mathematically correct for DDPM and may produce noisy/blurry results. "
-                f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler. "
-                f"(This warning will only show once per model instance.)",
-                UserWarning
-            )
+            if not getattr(self, '_suppress_subsampling_warning', False):
+                warnings.warn(
+                    f"[SCIENTIFIC WARNING] Using {num_steps} steps instead of {self.timesteps} is naive subsampling. "
+                    f"This is NOT mathematically correct for DDPM and may produce noisy/blurry results. "
+                    f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler. "
+                    f"(This warning will only show once per model instance. Use --suppress-subsampling-warning to hide.)",
+                    UserWarning
+                )
             self._subsampling_warning_shown = True
         
         step_size = self.timesteps // num_steps
@@ -6153,6 +6158,8 @@ def main():
     parser.add_argument("--num-sampling-steps", type=int, default=50,
                        help="Number of sampling steps for inference (default: 50 for speed, 1000 for valid FID). "
                             "Warning: Using <1000 steps is naive subsampling and may produce invalid FID scores.")
+    parser.add_argument("--suppress-subsampling-warning", action="store_true",
+                       help="Suppress the scientific warning about naive subsampling (<1000 steps)")
     
     # ES ablation
     parser.add_argument("--es-sigma-values", type=float, nargs='+',
