@@ -4489,7 +4489,7 @@ class BBBC021AblationRunner:
         
         num_samples = 0
         
-        print("  Generating samples for Full Paper Evaluation...")
+        print("  Sampling images from model for Full Paper Evaluation...")
         with torch.no_grad():
             for batch in val_loader:
                 if num_samples >= max_samples: 
@@ -5673,7 +5673,7 @@ Learned Statistics:
                     all_moas.extend(batch['moa_idx'].cpu().tolist() if torch.is_tensor(batch['moa_idx']) else batch['moa_idx'])
                 
                 num_samples += len(control)
-                print(f"  Generated {num_samples}/{self.config.eval_samples}...", end='\r')
+                print(f"  Sampling images: {num_samples}/{self.config.eval_samples}...", end='\r')
 
         # Concat
         real_imgs = np.concatenate(all_real, axis=0)[:self.config.eval_samples]
