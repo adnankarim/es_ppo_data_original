@@ -2437,12 +2437,12 @@ class ImageDDPM:
         if num_steps < self.timesteps and not self._subsampling_warning_shown:
             # Check if warnings are suppressed via global flag
             import warnings
-            if not getattr(self, '_suppress_subsampling_warning', False):
+            if not ImageDDPM._suppress_subsampling_warning:
                 warnings.warn(
                     f"[SCIENTIFIC WARNING] Using {num_steps} steps instead of {self.timesteps} is naive subsampling. "
                     f"This is NOT mathematically correct for DDPM and may produce noisy/blurry results. "
                     f"For valid FID scores, use num_steps={self.timesteps} or implement DDIM sampler. "
-                    f"(This warning will only show once per model instance. Use --suppress-subsampling-warning to hide.)",
+                    f"(This warning will only show once. Use --suppress-subsampling-warning to hide.)",
                     UserWarning
                 )
             self._subsampling_warning_shown = True
@@ -6241,6 +6241,10 @@ def main():
                         help="Dataset split to use for evaluation mode (train, val, test)")
     
     args = parser.parse_args()
+    
+    # Suppress subsampling warning if requested
+    if args.suppress_subsampling_warning:
+        ImageDDPM._suppress_subsampling_warning = True
     
     config = BBBC021Config(
         mode=args.mode,
