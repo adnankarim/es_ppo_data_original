@@ -646,7 +646,7 @@ class BBBC021Dataset(Dataset):
             metadata_path = Path(metadata_file)
         else:
             # Otherwise, assume it's relative to data_dir
-        metadata_path = self.data_dir / metadata_file
+            metadata_path = self.data_dir / metadata_file
         
         if not metadata_path.exists():
             raise FileNotFoundError(
