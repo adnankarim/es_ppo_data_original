@@ -3447,6 +3447,11 @@ class BBBC021AblationRunner:
         # Store results
         self.all_results = {'ES': [], 'PPO': []}
         
+        # Track best FID globally for conditional visualization
+        self.best_fid_so_far = float('inf')
+        self.best_fid_epoch = 0
+        self.best_fid_method = None
+        
         print(f"Output directory: {self.output_dir}")
         print(f"Device: {config.device}")
         print(f"Train samples: {len(self.train_dataset)}")
@@ -4113,7 +4118,7 @@ class BBBC021AblationRunner:
                 gpu_stats = self._get_gpu_stats()
                 
                 # Evaluate during warmup
-                metrics = self._evaluate(cond_ddpm)
+                metrics = self._evaluate(cond_ddpm, epoch=warmup_epoch + 1, method="ES")
                 metrics['epoch'] = warmup_epoch + 1
                 metrics['loss'] = avg_loss
                 metrics['sigma'] = sigma
@@ -4179,7 +4184,7 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            metrics = self._evaluate(cond_ddpm)
+            metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="ES")
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['sigma'] = sigma
@@ -4314,7 +4319,7 @@ class BBBC021AblationRunner:
             gpu_stats = self._get_gpu_stats()
             
             # Evaluate
-            metrics = self._evaluate(cond_ddpm)
+            metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="PPO")
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['kl_weight'] = kl_weight
@@ -4459,13 +4464,15 @@ class BBBC021AblationRunner:
             'nscb_num_samples': len(real_imgs)
         }
     
-    def _evaluate(self, cond_ddpm: ImageDDPM) -> Dict:
+    def _evaluate(self, cond_ddpm: ImageDDPM, epoch: int = None, method: str = None) -> Dict:
         """
         [PAPER COMPLIANT] Evaluation Routine.
         Calculates:
         1. Overall FID & KID (Global Distribution)
         2. Conditional FID (Per-compound Average) -> The key metric to beat (56.8)
         3. Deep MoA Accuracy (Using Inception Features) -> Target > 70%
+        
+        Generates visualizations ONLY when a new best FID is achieved.
         """
         cond_ddpm.model.eval()
         metrics_engine = ImageMetrics(device=self.config.aux_device)
@@ -4614,6 +4621,29 @@ class BBBC021AblationRunner:
         
         # Log all metrics to wandb
         self._log_metrics_to_wandb(metrics, prefix="evaluation/")
+        
+        # --- CONDITIONAL VISUALIZATION: Only on New Best FID ---
+        fid_current = metrics.get('fid', float('inf'))
+        if epoch is not None and fid_current < self.best_fid_so_far:
+            print(f"\n  ★★ New Best FID: {fid_current:.2f} < {self.best_fid_so_far:.2f} (Epoch {epoch})")
+            self.best_fid_so_far = fid_current
+            self.best_fid_epoch = epoch
+            self.best_fid_method = method or "Unknown"
+            
+            # Generate visualizations for this best model
+            print(f"  [Viz] Generating visualizations for best FID model...")
+            try:
+                # Generate diffusion video showing the denoising process
+                video_name = f"diffusion_BEST_FID_{fid_current:.2f}_epoch_{epoch}.mp4"
+                self.generate_diffusion_video(
+                    cond_ddpm, 
+                    output_filename=video_name, 
+                    num_frames=50
+                )
+                
+                print(f"  ✓ Visualizations saved for best FID: {fid_current:.2f}")
+            except Exception as e:
+                print(f"  Warning: Failed to generate visualizations: {e}")
         
         return metrics
     
