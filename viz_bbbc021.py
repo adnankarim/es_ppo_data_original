@@ -1,4 +1,5 @@
 import os
+import re
 import argparse
 import csv
 import numpy as np
@@ -59,43 +60,106 @@ class BBBC021VizDataset:
     def __len__(self):
         return len(self.metadata)
 
+    def _parse_week_plate_from_filename(self, filename):
+        """Extract week and plate from filename like 'Week1_22361_1_2975_57.0'."""
+        # Pattern: Week{number}_{plate}_{rest}
+        match = re.match(r'Week(\d+)_(\d+)_', filename)
+        if match:
+            week_num = match.group(1)
+            plate_num = match.group(2)
+            return f"Week{week_num}", plate_num
+        return None, None
+
     def _find_image_file(self, meta):
         """Tries multiple path combinations to find the file."""
         candidates = []
-        filename = meta['filename']
+        original_filename = meta['filename']
         
-        # Ensure extension
-        if not filename.endswith('.npy'):
-            filename += '.npy'
+        # Get week/plate from CSV columns or parse from filename
+        week = meta['week']
+        plate = meta['plate']
+        
+        # If week/plate not in CSV, try parsing from filename
+        if not week or not plate:
+            parsed_week, parsed_plate = self._parse_week_plate_from_filename(original_filename)
+            if parsed_week and parsed_plate:
+                week = week or parsed_week
+                plate = plate or parsed_plate
 
-        # Candidate 1: Direct path (data_dir/filename.npy)
-        candidates.append(self.data_dir / filename)
+        # PRIORITY 1: Nested path with STRIPPED filename (most common case)
+        # Files are at: Week1/22361/1_2975_57.0.npy (stripped of Week1_22361_ prefix)
+        if week and plate:
+            # Strip the Week{num}_{plate}_ prefix from filename
+            # Pattern: Week1_22361_1_2975_57.0 -> 1_2975_57.0
+            stripped_match = re.match(rf'Week\d+_{plate}_(.+)', original_filename)
+            if stripped_match:
+                stripped_name = stripped_match.group(1)
+                if not stripped_name.endswith('.npy'):
+                    stripped_name += '.npy'
+                # This is the most likely path - add it first
+                candidates.append(self.data_dir / week / plate / stripped_name)
 
-        # Candidate 2: Nested path (data_dir/Week/Plate/filename.npy)
-        if meta['week'] and meta['plate']:
-            candidates.append(self.data_dir / meta['week'] / meta['plate'] / filename)
+        # PRIORITY 2: Nested path with full filename
+        if week and plate:
+            full_filename = original_filename
+            if not full_filename.endswith('.npy'):
+                full_filename += '.npy'
+            candidates.append(self.data_dir / week / plate / full_filename)
+
+        # PRIORITY 3: Direct path (data_dir/filename.npy)
+        full_filename = original_filename
+        if not full_filename.endswith('.npy'):
+            full_filename += '.npy'
+        candidates.append(self.data_dir / full_filename)
             
-        # Candidate 3: Just Plate nested (data_dir/Plate/filename.npy)
-        if meta['plate']:
-             candidates.append(self.data_dir / meta['plate'] / filename)
+        # PRIORITY 4: Just Week nested
+        if week:
+            candidates.append(self.data_dir / week / full_filename)
 
+        # PRIORITY 5: Just Plate nested
+        if plate:
+            candidates.append(self.data_dir / plate / full_filename)
+
+        # PRIORITY 6: Try Week{num}/Plate{num} structure with Plate prefix
+        if week and plate and not plate.startswith('Plate'):
+            candidates.append(self.data_dir / week / f"Plate{plate}" / full_filename)
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_candidates = []
         for path in candidates:
+            path_str = str(path)
+            if path_str not in seen:
+                seen.add(path_str)
+                unique_candidates.append(path)
+
+        # Try each candidate
+        for path in unique_candidates:
             if path.exists():
-                return path
+                return path, unique_candidates
         
-        return candidates[0] # Return the first one (failed) for error printing
+        # Return first candidate for error reporting (shows what we tried)
+        if unique_candidates:
+            failed_path = unique_candidates[0]
+        else:
+            full_filename = original_filename
+            if not full_filename.endswith('.npy'):
+                full_filename += '.npy'
+            failed_path = self.data_dir / full_filename
+        return failed_path, unique_candidates
 
     def __getitem__(self, idx):
         meta = self.metadata[idx]
-        full_path = self._find_image_file(meta)
+        full_path, tried_paths = self._find_image_file(meta)
         
         try:
             # Load .npy file
             img_array = np.load(str(full_path))
             return img_array, meta
         except Exception as e:
-            # Return path for debug printing
-            return str(full_path), None
+            # Return path and tried paths for debug printing
+            error_msg = f"{full_path}\n  (Tried: {', '.join(str(p) for p in tried_paths[:3])}...)"
+            return error_msg, None
 
 # ==============================================================================
 # 2. VISUALIZATION
@@ -120,9 +184,12 @@ def visualize_random_samples(dataset, num_samples=5, output_file="bbbc021_grid.p
 
         if meta is None:
             # This means loading failed. 'data' contains the failed path string.
-            print(f"  [Error] Could not find file: {data}")
-            ax.text(0.5, 0.5, "File Not Found", ha='center', va='center')
-            ax.set_title("Missing File", color='red')
+            print(f"  [Error] Could not find file")
+            print(f"    Attempted: {data.split('(Tried:')[0] if '(Tried:' in data else data}")
+            if '(Tried:' in data:
+                print(f"    {data.split('(Tried:')[1]}")
+            ax.text(0.5, 0.5, "File Not Found", ha='center', va='center', fontsize=8)
+            ax.set_title("Missing File", color='red', fontsize=8)
             ax.axis('off')
             continue
 
