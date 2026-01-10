@@ -318,10 +318,13 @@ class BBBC021Config:
     num_eval_samples: int = 1000
     fid_batch_size: int = 64
     # Evaluation Mode
-    eval_samples: int = 5000
+    eval_samples: int = 1000
     checkpoint_path: Optional[str] = None
     eval_batch_size: int = 64
     eval_split: str = "test"  # [NEW] Split to use for evaluation ('train', 'val', 'test')
+    # Training Evaluation Control
+    skip_fid_during_training: bool = False  # Skip expensive FID/KID calculation during training
+    eval_frequency: int = 1  # Evaluate FID/KID every N epochs
     
     # Memory optimization
     gradient_checkpointing: bool = True
@@ -3919,8 +3922,10 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
 
-            # 2. Evaluate (Every 150 epochs)
-            if (epoch + 1) % 1 == 0:
+            # 2. Evaluate (Controlled by eval_frequency or skip flag)
+            should_evaluate = (epoch + 1) % self.config.eval_frequency == 0 and not self.config.skip_fid_during_training
+            
+            if should_evaluate:
                 # FIXED: Evaluate on validation set (which is Test in CellFlux mode)
                 metrics = self._evaluate_pretrain(ddpm, self.val_dataset)
                 fid_score = metrics.get('fid', 0.0)
@@ -3968,15 +3973,16 @@ class BBBC021AblationRunner:
                 # Log all metrics to wandb (including FID)
                 self._log_metrics_to_wandb(metrics, prefix="pretrain/", step=epoch + 1)
             else:
-                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f}")
+                # Skip FID evaluation, print loss only
+                print(f"    Epoch {epoch+1}/{target_epoch} | Loss: {avg_loss:.4f} | GPU: {gpu_stats['gpu_mem_max_mb']:.0f}MB")
 
             # [NEW] Step the Cosine Annealing LR Scheduler
             scheduler.step()
             current_lr = scheduler.get_last_lr()[0]
-            if (epoch + 1) % 2 == 0:  # Print LR every 150 epochs (same as evaluation)
+            if (epoch + 1) % 10 == 0:  # Print LR every 10 epochs
                 print(f"    Current LR: {current_lr:.2e}")
 
-            # 3. Checkpoint
+            # 3. Save Checkpoint Every Epoch (regardless of FID calculation)
             self._save_checkpoint(ddpm, ddpm.optimizer, epoch + 1, "ddpm_pretrain_latest.pt", is_global=True)
             
         # Final evaluation at last epoch (for CellFlux mode reporting)
@@ -4195,7 +4201,15 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="ES")
+            # Evaluate (Controlled by eval_frequency or skip flag)
+            should_evaluate = (epoch + 1) % self.config.eval_frequency == 0 and not self.config.skip_fid_during_training
+            
+            if should_evaluate:
+                metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="ES")
+            else:
+                # Skip FID evaluation, create minimal metrics
+                metrics = {'fid': float('inf'), 'fid_conditional': float('inf'), 'kid': 0.0, 'moa_accuracy': 0.0}
+            
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['sigma'] = sigma
@@ -4208,8 +4222,8 @@ class BBBC021AblationRunner:
             # Get FID score
             fid_score = metrics.get('fid', 0.0)
             
-            # Track best FID and save best checkpoint
-            if fid_score < best_es_fid:
+            # Track best FID and save best checkpoint (only if FID was calculated)
+            if should_evaluate and fid_score < best_es_fid:
                 best_es_fid = fid_score
                 # Save best checkpoint
                 self._save_checkpoint(cond_ddpm, None, epoch + 1, 
@@ -4218,19 +4232,22 @@ class BBBC021AblationRunner:
                 print(f"  New best FID: {fid_score:.2f} - Saved best checkpoint")
             
             # Save checkpoint with FID whenever FID is calculated
-            self._save_checkpoint(cond_ddpm, None, epoch + 1, checkpoint_name,
-                                fid=fid_score, method="ES", config_idx=config_idx)
+            if should_evaluate:
+                self._save_checkpoint(cond_ddpm, None, epoch + 1, checkpoint_name,
+                                    fid=fid_score, method="ES", config_idx=config_idx)
             
-            # Plot checkpoint
-            checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', f'σ={sigma}, lr={lr}')
+            # Plot checkpoint (only if FID was calculated)
+            if should_evaluate:
+                checkpoint_dir = os.path.join(self.plots_dir, f'ES_config_{config_idx}')
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', f'σ={sigma}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                # [PAPER COMPLIANT] Extract key metrics
-                fid_cond = metrics.get('fid_conditional', 0.0)  # The competitive metric (Target: 56.8)
+                if should_evaluate:
+                    # [PAPER COMPLIANT] Extract key metrics
+                    fid_cond = metrics.get('fid_conditional', 0.0)  # The competitive metric (Target: 56.8)
                 kid = metrics.get('kid', 0.0)
                 moa = metrics.get('moa_accuracy', 0.0)
                 kl = metrics.get('kl_div_total', 0.0)
@@ -4329,8 +4346,15 @@ class BBBC021AblationRunner:
             # Get GPU stats
             gpu_stats = self._get_gpu_stats()
             
-            # Evaluate
-            metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="PPO")
+            # Evaluate (Controlled by eval_frequency or skip flag)
+            should_evaluate = (epoch + 1) % self.config.eval_frequency == 0 and not self.config.skip_fid_during_training
+            
+            if should_evaluate:
+                metrics = self._evaluate(cond_ddpm, epoch=epoch + 1, method="PPO")
+            else:
+                # Skip FID evaluation, create minimal metrics
+                metrics = {'fid': float('inf'), 'fid_conditional': float('inf'), 'kid': 0.0, 'moa_accuracy': 0.0}
+            
             metrics['epoch'] = epoch + 1
             metrics['loss'] = avg_loss
             metrics['kl_weight'] = kl_weight
@@ -4344,8 +4368,8 @@ class BBBC021AblationRunner:
             # Get FID score
             fid_score = metrics.get('fid', 0.0)
             
-            # Track best FID and save best checkpoint
-            if fid_score < best_ppo_fid:
+            # Track best FID and save best checkpoint (only if FID was calculated)
+            if should_evaluate and fid_score < best_ppo_fid:
                 best_ppo_fid = fid_score
                 # Save best checkpoint
                 self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, 
@@ -4354,30 +4378,35 @@ class BBBC021AblationRunner:
                 print(f"  New best FID: {fid_score:.2f} - Saved best checkpoint")
             
             # Save checkpoint with FID whenever FID is calculated
-            self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name,
-                                fid=fid_score, method="PPO", config_idx=config_idx)
+            if should_evaluate:
+                self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name,
+                                    fid=fid_score, method="PPO", config_idx=config_idx)
             
-            # Plot checkpoint
-            checkpoint_dir = os.path.join(self.plots_dir, f'PPO_config_{config_idx}')
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', f'KL={kl_weight}, lr={lr}')
+            # Plot checkpoint (only if FID was calculated)
+            if should_evaluate:
+                checkpoint_dir = os.path.join(self.plots_dir, f'PPO_config_{config_idx}')
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', f'KL={kl_weight}, lr={lr}')
 
             if (epoch + 1) % 5 == 0:
                 num_samples_used = metrics.get('num_eval_samples', self.config.num_eval_samples)
                 
-                # [PAPER COMPLIANT] Extract key metrics
-                fid_cond = metrics.get('fid_conditional', 0.0)  # The competitive metric (Target: 56.8)
-                kid = metrics.get('kid', 0.0)
-                moa = metrics.get('moa_accuracy', 0.0)
-                kl = metrics.get('kl_div_total', 0.0)
-                mi = metrics.get('mutual_information', 0.0)
+                if should_evaluate:
+                    # [PAPER COMPLIANT] Extract key metrics
+                    fid_cond = metrics.get('fid_conditional', 0.0)  # The competitive metric (Target: 56.8)
+                    kid = metrics.get('kid', 0.0)
+                    moa = metrics.get('moa_accuracy', 0.0)
+                    kl = metrics.get('kl_div_total', 0.0)
+                    mi = metrics.get('mutual_information', 0.0)
 
-                print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID(All)={metrics['fid']:.2f} | FID(Cond)={fid_cond:.2f} | KID={kid:.2f} | MoA={moa*100:.1f}% | KL={kl:.4f} | MI={mi:.4f}")
+                    print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} | FID(All)={metrics['fid']:.2f} | FID(Cond)={fid_cond:.2f} | KID={kid:.2f} | MoA={moa*100:.1f}% | KL={kl:.4f} | MI={mi:.4f}")
+                else:
+                    print(f"    Epoch {epoch+1}: Loss={avg_loss:.4f} (FID evaluation skipped)")
             
             # Log all metrics to wandb (including FID, FID_conditional, KID, MoA, etc.)
             self._log_metrics_to_wandb(metrics, prefix=f"PPO/config_{config_idx}/", step=epoch + 1)
             
-            # Save Checkpoint
+            # Save Checkpoint Every Epoch (regardless of FID calculation)
             self._save_checkpoint(cond_ddpm, ppo_trainer.optimizer, epoch + 1, checkpoint_name)
         
         final_metrics = epoch_metrics[-1] if epoch_metrics else {}
@@ -6197,6 +6226,10 @@ def main():
                             "Warning: Using <1000 steps is naive subsampling and may produce invalid FID scores.")
     parser.add_argument("--suppress-subsampling-warning", action="store_true",
                        help="Suppress the scientific warning about naive subsampling (<1000 steps)")
+    parser.add_argument("--skip-fid-during-training", action="store_true",
+                       help="Skip FID/KID calculation during training to save time (checkpoints still saved every epoch)")
+    parser.add_argument("--eval-frequency", type=int, default=1,
+                       help="Evaluate FID/KID every N epochs (default: 1). Use higher values to save time.")
     
     # ES ablation
     parser.add_argument("--es-sigma-values", type=float, nargs='+',
