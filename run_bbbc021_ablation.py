@@ -6336,6 +6336,8 @@ def main():
         ddpm_lr=args.ddpm_lr,
         coupling_batch_size=args.coupling_batch_size,
         num_sampling_steps=args.num_sampling_steps,
+        skip_fid_during_training=args.skip_fid_during_training,
+        eval_frequency=args.eval_frequency,
         es_sigma_values=args.es_sigma_values,
         es_lr_values=args.es_lr_values,
         es_population_size=args.es_population_size,
