@@ -3552,6 +3552,12 @@ class BBBC021AblationRunner:
         }
         if model.perturbation_encoder:
             state['perturbation_encoder_state_dict'] = model.perturbation_encoder.state_dict()
+        
+        # Add architecture metadata for proper loading
+        if hasattr(model, 'use_transformer'):
+            state['use_transformer'] = model.use_transformer
+        elif hasattr(model.model, 'use_transformer'):
+            state['use_transformer'] = model.model.use_transformer
             
         # Add FID to state if provided
         if fid is not None:
@@ -5658,7 +5664,43 @@ Learned Statistics:
             checkpoint_type = "Unknown (Generic DDPM)"
         print(f"Detected checkpoint type: {checkpoint_type}")
 
-        # 1. Initialize Model Architecture
+        # 0. Load checkpoint first to detect architecture
+        print(f"Loading checkpoint to detect architecture...")
+        checkpoint = torch.load(self.config.checkpoint_path, map_location=self.config.device, weights_only=False)
+        
+        # Detect architecture from checkpoint keys or metadata
+        use_transformer = self.config.use_transformer  # Default to config value
+        
+        # First, check if checkpoint has metadata about architecture
+        if 'use_transformer' in checkpoint:
+            use_transformer = checkpoint['use_transformer']
+            print(f"  [ARCHITECTURE DETECTION] Found use_transformer={use_transformer} in checkpoint metadata")
+        elif 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            # Check for transformer-specific keys
+            transformer_keys = [k for k in state_dict.keys() if any(x in k for x in ['blocks.', 'skip_connections.', 'final_proj.', 'patch_embed.', 'drug_embed.'])]
+            # Check for UNet-specific keys
+            unet_keys = [k for k in state_dict.keys() if any(x in k for x in ['down_blocks.', 'up_blocks.', 'init_conv.', 'cond_embed.'])]
+            
+            if len(transformer_keys) > 0 and len(unet_keys) == 0:
+                print(f"  [ARCHITECTURE DETECTION] Checkpoint contains transformer architecture ({len(transformer_keys)} transformer keys found)")
+                use_transformer = True
+            elif len(unet_keys) > 0 and len(transformer_keys) == 0:
+                print(f"  [ARCHITECTURE DETECTION] Checkpoint contains UNet architecture ({len(unet_keys)} UNet keys found)")
+                use_transformer = False
+            elif len(transformer_keys) > 0 and len(unet_keys) > 0:
+                # Ambiguous - use config value but warn
+                print(f"  [WARNING] Checkpoint contains both transformer ({len(transformer_keys)} keys) and UNet ({len(unet_keys)} keys) keys.")
+                print(f"  Using config value: use_transformer={use_transformer}")
+            else:
+                print(f"  [WARNING] Could not detect architecture from checkpoint keys. Using config value: use_transformer={use_transformer}")
+        else:
+            print(f"  [WARNING] Checkpoint format not recognized. Using config value: use_transformer={use_transformer}")
+        
+        if use_transformer != self.config.use_transformer:
+            print(f"  [OVERRIDE] Setting use_transformer={use_transformer} to match checkpoint architecture (config had {self.config.use_transformer})")
+
+        # 1. Initialize Model Architecture with detected architecture
         # Create model directly (no need for pretrained model transfer in eval mode)
         model = ImageDDPM(
             image_size=self.config.image_size,
@@ -5671,13 +5713,12 @@ Learned Statistics:
             conditional=True,
             cond_emb_dim=self.config.perturbation_embed_dim,
             fingerprint_input_dim=self.fingerprint_dim,
-            use_transformer=self.config.use_transformer,
+            use_transformer=use_transformer,  # Use detected value
             cfg_dropout_prob=self.config.cfg_dropout_prob,
         )
         
         # 2. Load Weights (handles all checkpoint formats)
         print(f"Loading weights from {self.config.checkpoint_path}...")
-        checkpoint = torch.load(self.config.checkpoint_path, map_location=self.config.device, weights_only=False)
 
         # Handle different checkpoint formats
         # Format 1: Standard format from _save_checkpoint (used by pretrain, ES, PPO)
