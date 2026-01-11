@@ -2965,29 +2965,21 @@ class ImageMetrics:
         return np.mean(fids), class_fids
 
     @torch.no_grad()
-    def compute_kid(self, real_images: np.ndarray, fake_images: np.ndarray) -> float:
+    def compute_kid(self, real_images: np.ndarray, fake_images: np.ndarray, batch_size: int = 16) -> float:
         """
         Computes KID scaled by 1000 (Target: ~1.62).
-        Uses the pre-loaded metric from __init__ for efficiency.
+        SAFE MODE: Processes in small batches (16) to fit in <20GB VRAM.
         Handles cases where sample count is less than subset_size.
+        
+        Args:
+            real_images: Real images array (N, H, W, C) in [-1, 1] range
+            fake_images: Fake images array (N, H, W, C) in [-1, 1] range
+            batch_size: Number of images to process at once (default: 16 for 20GB VRAM)
         """
         if self.kid_metric is None:
             return 0.0
 
         num_samples = min(len(real_images), len(fake_images))
-        
-        # Convert to Tensor [0, 1] range on correct device
-        real_t = torch.tensor(real_images).float().to(self.device)
-        fake_t = torch.tensor(fake_images).float().to(self.device)
-        
-        # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
-        # Remove auto-detection to prevent inconsistent normalization between real/fake images
-        # The loader normalizes to [-1, 1] via: (img / 127.5) - 1.0
-        real_t = (real_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-        fake_t = (fake_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-            
-        real_t = torch.clamp(real_t, 0, 1)
-        fake_t = torch.clamp(fake_t, 0, 1)
         
         # Handle case where sample count is less than subset_size
         # The default subset_size is 100, but we may have fewer samples
@@ -2997,16 +2989,62 @@ class ImageMetrics:
             # Use at least 10 samples, but not more than available
             adjusted_subset_size = max(10, min(num_samples, 50))
             temp_kid_metric = KernelInceptionDistance(subset_size=adjusted_subset_size, normalize=True).to(self.device)
-            temp_kid_metric.update(real_t, real=True)
-            temp_kid_metric.update(fake_t, real=False)
+            
+            # Process in batches even for small sample sizes
+            print(f"  [Metrics] Computing KID in batches of {batch_size} (small sample size: {num_samples})...")
+            for i in range(0, num_samples, batch_size):
+                # Slice the batch (Keep on CPU initially)
+                r_batch_np = real_images[i : i + batch_size]
+                f_batch_np = fake_images[i : i + batch_size]
+                
+                # Move ONLY this tiny batch to GPU
+                r_t = torch.tensor(r_batch_np).float().to(self.device)
+                f_t = torch.tensor(f_batch_np).float().to(self.device)
+                
+                # Normalize [-1, 1] -> [0, 1]
+                r_t = (r_t + 1.0) / 2.0
+                f_t = (f_t + 1.0) / 2.0
+                
+                r_t = torch.clamp(r_t, 0.0, 1.0)
+                f_t = torch.clamp(f_t, 0.0, 1.0)
+                
+                # Update Metric (Extracts features and discards the heavy images immediately)
+                temp_kid_metric.update(r_t, real=True)
+                temp_kid_metric.update(f_t, real=False)
+            
             kid_mean, _ = temp_kid_metric.compute()
         else:
             # Use the pre-loaded metric for efficiency
             self.kid_metric.reset()  # Important: Clear previous batch stats
-            self.kid_metric.update(real_t, real=True)
-            self.kid_metric.update(fake_t, real=False)
+            
+            # Process in batches to avoid OOM
+            print(f"  [Metrics] Computing KID in batches of {batch_size}...")
+            for i in range(0, num_samples, batch_size):
+                # Slice the batch (Keep on CPU initially)
+                r_batch_np = real_images[i : i + batch_size]
+                f_batch_np = fake_images[i : i + batch_size]
+                
+                # Move ONLY this tiny batch to GPU
+                r_t = torch.tensor(r_batch_np).float().to(self.device)
+                f_t = torch.tensor(f_batch_np).float().to(self.device)
+                
+                # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
+                # Remove auto-detection to prevent inconsistent normalization between real/fake images
+                # The loader normalizes to [-1, 1] via: (img / 127.5) - 1.0
+                r_t = (r_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                f_t = (f_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                
+                r_t = torch.clamp(r_t, 0.0, 1.0)
+                f_t = torch.clamp(f_t, 0.0, 1.0)
+                
+                # Update Metric (Extracts features and discards the heavy images immediately)
+                self.kid_metric.update(r_t, real=True)
+                self.kid_metric.update(f_t, real=False)
+            
+            # Compute final score from accumulated features
             kid_mean, _ = self.kid_metric.compute()
         
+        # Scale by 1000 for standard readability (e.g., 0.001 -> 1.0)
         return float(kid_mean.item()) * 1000.0
 
     @staticmethod
@@ -3114,28 +3152,40 @@ class ImageMetrics:
     
     # Legacy static method for backward compatibility (used in _nscb_benchmark)
     @staticmethod
-    def compute_fid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda') -> float:
-        """Legacy method: Computes FID using InceptionV3 features (creates new metric each time)."""
+    def compute_fid(real_images: np.ndarray, fake_images: np.ndarray, device='cuda', batch_size: int = 16) -> float:
+        """
+        Legacy method: Computes FID using InceptionV3 features (creates new metric each time).
+        SAFE MODE: Processes in small batches (16) to fit in <20GB VRAM.
+        """
         if not TORCHMETRICS_AVAILABLE:
             return 0.0
 
         fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
         
-        # Convert to Tensor [0, 1] range
-        real_t = torch.tensor(real_images).float().to(device)
-        fake_t = torch.tensor(fake_images).float().to(device)
+        num_samples = min(len(real_images), len(fake_images))
         
-        # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
-        # Remove auto-detection to prevent inconsistent normalization between real/fake images
-        real_t = (real_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
-        fake_t = (fake_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        # Process in batches to avoid OOM
+        print(f"  [Metrics] Computing FID in batches of {batch_size}...")
+        for i in range(0, num_samples, batch_size):
+            # Slice the batch (Keep on CPU initially)
+            r_batch_np = real_images[i : i + batch_size]
+            f_batch_np = fake_images[i : i + batch_size]
             
-        real_t = torch.clamp(real_t, 0.0, 1.0)
-        fake_t = torch.clamp(fake_t, 0.0, 1.0)
-        
-        # Standard update handles float->uint8 conversion internally
-        fid.update(real_t, real=True)
-        fid.update(fake_t, real=False)
+            # Move ONLY this tiny batch to GPU
+            r_t = torch.tensor(r_batch_np).float().to(device)
+            f_t = torch.tensor(f_batch_np).float().to(device)
+            
+            # CRITICAL FIX: Always assume input is [-1, 1] (standard DDPM normalization)
+            # Remove auto-detection to prevent inconsistent normalization between real/fake images
+            r_t = (r_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+            f_t = (f_t + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                
+            r_t = torch.clamp(r_t, 0.0, 1.0)
+            f_t = torch.clamp(f_t, 0.0, 1.0)
+            
+            # Update Metric (Extracts features and discards the heavy images immediately)
+            fid.update(r_t, real=True)
+            fid.update(f_t, real=False)
         
         return float(fid.compute().item())
 
