@@ -49,7 +49,8 @@ for CKPT in "${CHECKPOINTS[@]}"; do
       --use-molformer \
       --perturbation-embed-dim "$PERT_EMBED_DIM" \
       --use-ema \
-      --aux-device cuda
+      --aux-device cuda \
+      --num-sampling-steps 1000
 
     echo ""
     echo "✓ Completed evaluation with ${N} samples"
