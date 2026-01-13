@@ -3418,6 +3418,7 @@ class BBBC021AblationRunner:
                 if not has_original_val:
                     print("  [Note] No 'val' split found in CSV, using 'test' for evaluation")
                     val_df = test_df.copy()  # Use test as val for evaluation
+                    val_df["SPLIT"] = "val"  # Update SPLIT column so dataset loader can find it
                 else:
                     val_df = val_df_original
                 
