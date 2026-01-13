@@ -3486,13 +3486,17 @@ class BBBC021AblationRunner:
             split_summary("TEST", test_df)
             
             # Verify no batch leakage - CRITICAL: Raise error if leakage detected
-            train_batches = set(train_df["BATCH"].unique()) if len(train_df) > 0 else set()
-            val_batches = set(val_df["BATCH"].unique()) if len(val_df) > 0 else set()
-            overlap = train_batches & val_batches
-            if overlap:
-                raise ValueError(f"CRITICAL ERROR: Batch leakage detected! {len(overlap)} batches in both sets: {list(overlap)[:10]}...")
+            # Skip this check when using original CSV splits (may have overlapping batches)
+            if not config.use_original_val:
+                train_batches = set(train_df["BATCH"].unique()) if len(train_df) > 0 else set()
+                val_batches = set(val_df["BATCH"].unique()) if len(val_df) > 0 else set()
+                overlap = train_batches & val_batches
+                if overlap:
+                    raise ValueError(f"CRITICAL ERROR: Batch leakage detected! {len(overlap)} batches in both sets: {list(overlap)[:10]}...")
+                else:
+                    print("✓ TRAIN and VAL batches are disjoint (no leakage)")
             else:
-                print("✓ TRAIN and VAL batches are disjoint (no leakage)")
+                print("✓ Using original CSV splits (batch overlap check skipped)")
             print("=" * 40 + "\n")
             
             # 2. Save splits as CSVs for dataset loading (Absolute Paths recommended to avoid confusion)
