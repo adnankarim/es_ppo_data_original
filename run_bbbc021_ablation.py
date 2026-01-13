@@ -3397,21 +3397,29 @@ class BBBC021AblationRunner:
         else:
             # Check if we should use original CSV splits or create our own
             if config.use_original_val:
-                print("\n=== MODE: Original Val Split (All Train Samples for Training) ===")
-                print("  Strategy: Use all train samples for training, original val for evaluation")
+                print("\n=== MODE: Original CSV Splits (All Train Samples for Training) ===")
+                print("  Strategy: Use all train samples for training, use test for evaluation")
                 
                 # Use original splits from CSV
                 if "SPLIT" not in full_df.columns:
                     raise ValueError("CSV must have 'SPLIT' column when using --use-original-val")
                 
                 train_df = full_df[full_df["SPLIT"].str.lower() == "train"].copy()
-                val_df = full_df[full_df["SPLIT"].str.lower() == "val"].copy()
+                val_df_original = full_df[full_df["SPLIT"].str.lower() == "val"].copy()  # May be empty
                 test_df = full_df[full_df["SPLIT"].str.lower() == "test"].copy()
                 
                 if len(train_df) == 0:
                     raise ValueError("No training data found in CSV. Check SPLIT column.")
-                if len(val_df) == 0:
-                    raise ValueError("No validation data found in CSV. Check SPLIT column.")
+                if len(test_df) == 0:
+                    raise ValueError("No test data found in CSV. Check SPLIT column.")
+                
+                # If no val split exists in CSV, use test for both val and test
+                has_original_val = len(val_df_original) > 0
+                if not has_original_val:
+                    print("  [Note] No 'val' split found in CSV, using 'test' for evaluation")
+                    val_df = test_df.copy()  # Use test as val for evaluation
+                else:
+                    val_df = val_df_original
                 
                 split_info = {
                     "train_batches": sorted(train_df["BATCH"].unique()) if len(train_df) > 0 else [],
@@ -3420,9 +3428,12 @@ class BBBC021AblationRunner:
                 }
                 
                 print(f"\n[Split] Using original CSV splits:")
-                print(f"  Train samples: {len(train_df)}")
-                print(f"  Val samples: {len(val_df)}")
+                print(f"  Train samples: {len(train_df)} (ALL samples used for training)")
+                if has_original_val:
+                    print(f"  Val samples: {len(val_df)}")
                 print(f"  Test samples: {len(test_df)}")
+                if not has_original_val:
+                    print(f"  [Note] Evaluation will use TEST set (no separate val split in CSV)")
                 
             else:
                 print("\n=== MODE: SOTA Beater (Held-out Batch Validation) ===")
