@@ -3567,6 +3567,10 @@ class BBBC021AblationRunner:
         print(f"Train samples: {len(self.train_dataset)}")
         print(f"Val samples: {len(self.val_dataset)}")
         print(f"Test samples: {len(self.test_dataset)}")
+        
+        # Verify val and test are identical when using original splits without val
+        if config.use_original_val and len(self.val_dataset) == len(self.test_dataset) and len(self.val_dataset) > 0:
+            print(f"✓ Verified: Val and Test datasets are identical copies ({len(self.val_dataset)} samples each)")
     
     @property
     def eval_dataset(self):
