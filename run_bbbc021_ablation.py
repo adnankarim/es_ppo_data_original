@@ -322,6 +322,7 @@ class BBBC021Config:
     checkpoint_path: Optional[str] = None
     eval_batch_size: int = 64
     eval_split: str = "test"  # [NEW] Split to use for evaluation ('train', 'val', 'test')
+    use_original_val: bool = False  # Use original CSV val split instead of creating train/val from train pool
     # Training Evaluation Control
     skip_fid_during_training: bool = False  # Skip expensive FID/KID calculation during training
     eval_frequency: int = 1  # Evaluate FID/KID every N epochs
@@ -3394,47 +3395,77 @@ class BBBC021AblationRunner:
             self.test_dataset = test_dataset_cf
             print("=" * 40 + "\n")
         else:
-            print("\n=== MODE: SOTA Beater (Held-out Batch Validation) ===")
-            print("  Strategy: Legitimate tuning (reports Best Epoch on unseen batches)")
-            
-            # 1. CRITICAL: Use deterministic splits to prevent data leakage
-            # Save splits to fixed location based on seed for reproducibility
-            splits_dir = os.path.abspath(os.path.join(self.output_dir, "fixed_splits"))
-            os.makedirs(splits_dir, exist_ok=True)
-            
-            # Create deterministic filename based on seed and data hash
-            import hashlib
-            data_hash = hashlib.md5(str(full_df["BATCH"].unique()).encode()).hexdigest()[:8]
-            splits_file = os.path.join(splits_dir, f"splits_seed{config.seed}_{data_hash}.json")
-            
-            # Try to load existing splits
-            if os.path.exists(splits_file):
-                print(f"[Split] Loading existing deterministic splits from: {splits_file}")
-                import json
-                with open(splits_file, 'r') as f:
-                    split_data = json.load(f)
-                train_df = full_df[full_df.index.isin(split_data['train_indices'])].copy()
-                val_df = full_df[full_df.index.isin(split_data['val_indices'])].copy()
-                test_df = full_df[full_df.index.isin(split_data['test_indices'])].copy()
-                split_info = split_data['info']
-            else:
-                # Generate new splits
-                print(f"[Split] Generating new deterministic splits (seed={config.seed})...")
-                train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, val_size=0.15, seed=config.seed)
+            # Check if we should use original CSV splits or create our own
+            if config.use_original_val:
+                print("\n=== MODE: Original Val Split (All Train Samples for Training) ===")
+                print("  Strategy: Use all train samples for training, original val for evaluation")
                 
-                # Save splits for future runs
-                split_data = {
-                    'train_indices': train_df.index.tolist(),
-                    'val_indices': val_df.index.tolist(),
-                    'test_indices': test_df.index.tolist(),
-                    'info': split_info,
-                    'seed': config.seed,
-                    'data_hash': data_hash
+                # Use original splits from CSV
+                if "SPLIT" not in full_df.columns:
+                    raise ValueError("CSV must have 'SPLIT' column when using --use-original-val")
+                
+                train_df = full_df[full_df["SPLIT"].str.lower() == "train"].copy()
+                val_df = full_df[full_df["SPLIT"].str.lower() == "val"].copy()
+                test_df = full_df[full_df["SPLIT"].str.lower() == "test"].copy()
+                
+                if len(train_df) == 0:
+                    raise ValueError("No training data found in CSV. Check SPLIT column.")
+                if len(val_df) == 0:
+                    raise ValueError("No validation data found in CSV. Check SPLIT column.")
+                
+                split_info = {
+                    "train_batches": sorted(train_df["BATCH"].unique()) if len(train_df) > 0 else [],
+                    "val_batches": sorted(val_df["BATCH"].unique()) if len(val_df) > 0 else [],
+                    "test_batches": sorted(test_df["BATCH"].unique()) if len(test_df) > 0 else [],
                 }
-                import json
-                with open(splits_file, 'w') as f:
-                    json.dump(split_data, f, indent=2)
-                print(f"[Split] Saved deterministic splits to: {splits_file}")
+                
+                print(f"\n[Split] Using original CSV splits:")
+                print(f"  Train samples: {len(train_df)}")
+                print(f"  Val samples: {len(val_df)}")
+                print(f"  Test samples: {len(test_df)}")
+                
+            else:
+                print("\n=== MODE: SOTA Beater (Held-out Batch Validation) ===")
+                print("  Strategy: Legitimate tuning (reports Best Epoch on unseen batches)")
+                
+                # 1. CRITICAL: Use deterministic splits to prevent data leakage
+                # Save splits to fixed location based on seed for reproducibility
+                splits_dir = os.path.abspath(os.path.join(self.output_dir, "fixed_splits"))
+                os.makedirs(splits_dir, exist_ok=True)
+                
+                # Create deterministic filename based on seed and data hash
+                import hashlib
+                data_hash = hashlib.md5(str(full_df["BATCH"].unique()).encode()).hexdigest()[:8]
+                splits_file = os.path.join(splits_dir, f"splits_seed{config.seed}_{data_hash}.json")
+                
+                # Try to load existing splits
+                if os.path.exists(splits_file):
+                    print(f"[Split] Loading existing deterministic splits from: {splits_file}")
+                    import json
+                    with open(splits_file, 'r') as f:
+                        split_data = json.load(f)
+                    train_df = full_df[full_df.index.isin(split_data['train_indices'])].copy()
+                    val_df = full_df[full_df.index.isin(split_data['val_indices'])].copy()
+                    test_df = full_df[full_df.index.isin(split_data['test_indices'])].copy()
+                    split_info = split_data['info']
+                else:
+                    # Generate new splits
+                    print(f"[Split] Generating new deterministic splits (seed={config.seed})...")
+                    train_df, val_df, test_df, split_info = make_batch_aware_splits(full_df, val_size=0.15, seed=config.seed)
+                    
+                    # Save splits for future runs
+                    split_data = {
+                        'train_indices': train_df.index.tolist(),
+                        'val_indices': val_df.index.tolist(),
+                        'test_indices': test_df.index.tolist(),
+                        'info': split_info,
+                        'seed': config.seed,
+                        'data_hash': data_hash
+                    }
+                    import json
+                    with open(splits_file, 'w') as f:
+                        json.dump(split_data, f, indent=2)
+                    print(f"[Split] Saved deterministic splits to: {splits_file}")
             
             print("\n=== Batch-Aware Split Summary ===")
             
@@ -3520,6 +3551,17 @@ class BBBC021AblationRunner:
         print(f"Train samples: {len(self.train_dataset)}")
         print(f"Val samples: {len(self.val_dataset)}")
         print(f"Test samples: {len(self.test_dataset)}")
+    
+    @property
+    def eval_dataset(self):
+        """Return the appropriate dataset for evaluation based on config."""
+        split = self.config.eval_split.lower()
+        if split == "train":
+            return self.train_dataset
+        elif split == "val":
+            return self.val_dataset
+        else:  # test
+            return self.test_dataset
     
     def _load_checkpoint_if_exists(self, model, optimizer, filename, skip_optimizer=False):
         """
@@ -4328,7 +4370,7 @@ class BBBC021AblationRunner:
         cond_ddpm.save(model_path)
         
         # Run NSCB benchmark
-        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.test_dataset)
+        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.eval_dataset)
         final_metrics.update(nscb_results)
         
         # Log NSCB metrics to wandb
@@ -4473,7 +4515,7 @@ class BBBC021AblationRunner:
         self._plot_latent_clusters(cond_ddpm, 'PPO', config_idx)
         model_path = os.path.join(self.models_dir, f'PPO_config_{config_idx}_final.pt')
         cond_ddpm.save(model_path)
-        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.test_dataset)
+        nscb_results = self.run_nscb_benchmark(cond_ddpm, dataset=self.eval_dataset)
         final_metrics.update(nscb_results)
         
         # Log NSCB metrics to wandb
@@ -5441,8 +5483,8 @@ Learned Statistics:
 
         # Determine dataset if not passed
         if dataset is None:
-            # Fallback to test dataset
-            dataset = self.test_dataset
+            # Fallback to eval dataset
+            dataset = self.eval_dataset
 
         # Load Data (Shuffle False to scan everything deterministically)
         # Select correct loader type
@@ -6098,9 +6140,9 @@ Learned Statistics:
         inference_model = model.ema_model if (model.use_ema and model.ema_model is not None) else model.model
         inference_model.eval()
 
-        # 1. Pick a random sample from the test set
+        # 1. Pick a random sample from the eval set
         # We need a Control image, Fingerprint, and the Real Target image
-        dataset = self.test_dataset
+        dataset = self.eval_dataset
         
         # Get a perturbed sample (non-control) to generate
         perturbed_indices = dataset.get_perturbed_indices() if hasattr(dataset, 'get_perturbed_indices') else list(range(len(dataset)))
@@ -6400,6 +6442,8 @@ def main():
                         help="Batch size for evaluation generation")
     parser.add_argument("--eval-split", type=str, default="test", choices=["train", "val", "test"],
                         help="Dataset split to use for evaluation mode (train, val, test)")
+    parser.add_argument("--use-original-val", action="store_true",
+                        help="Use original validation split from CSV (keeps all train samples for training, uses original val for evaluation)")
     
     args = parser.parse_args()
     
@@ -6452,6 +6496,7 @@ def main():
         enable_bio_loss=args.enable_bio_loss,
         aux_device=args.aux_device,
         eval_split=args.eval_split,
+        use_original_val=args.use_original_val,
         # [FIX] Connect the argument to the config here:
         unet_channels=args.unet_channels,
     )
