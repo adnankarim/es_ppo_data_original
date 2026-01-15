@@ -5830,43 +5830,44 @@ Learned Statistics:
                 print(f"  [CHANNEL DETECTION] Found channels in checkpoint metadata: {detected_channels}")
             elif 'init_conv.weight' in state_dict:
                 # Try to infer channels from state_dict
-                # Strategy: Get first channel from init_conv, then get subsequent channels from down_blocks
+                # Strategy: Read channels directly from each down_block's res block time_mlp
+                # This is the most reliable method as it directly tells us the channel at each level
+                detected_channels = []
+                
+                # Get first channel from init_conv
                 # init_conv.weight shape: [channels[0], in_channels, 3, 3]
                 first_channel = state_dict['init_conv.weight'].shape[0]
-                detected_channels = [first_channel]
+                detected_channels.append(first_channel)
                 
                 # Get channels from each down_block's res block time_mlp
-                # down_blocks.0 has channels[0] (same as init_conv output)
-                # down_blocks.1 has channels[1] (after first downsample)
-                # down_blocks.2 has channels[2] (after second downsample)
-                # down_blocks.3 has channels[3] (after third downsample)
-                # We can get channels[i+1] from down_blocks[i].downsample.weight shape[0]
-                # OR from down_blocks[i+1].res1.time_mlp.1.weight shape[0]
-                for i in range(3):  # Check down_blocks 0, 1, 2 (to get channels 1, 2, 3)
-                    # Method 1: Check downsample output (most direct)
-                    downsample_key = f'down_blocks.{i}.downsample.weight'
-                    if downsample_key in state_dict:
-                        # downsample.weight shape: [channels[i+1], channels[i], 4, 4]
-                        next_channel = state_dict[downsample_key].shape[0]
-                        detected_channels.append(next_channel)
+                # down_blocks.0.res1.time_mlp.1.weight shape: [channels[0], time_emb_dim] (same as init_conv)
+                # down_blocks.1.res1.time_mlp.1.weight shape: [channels[1], time_emb_dim]
+                # down_blocks.2.res1.time_mlp.1.weight shape: [channels[2], time_emb_dim]
+                # down_blocks.3.res1.time_mlp.1.weight shape: [channels[3], time_emb_dim]
+                for i in range(1, 4):  # Check down_blocks 1, 2, 3 (skip 0 as it's same as init_conv)
+                    time_mlp_key = f'down_blocks.{i}.res1.time_mlp.1.weight'
+                    if time_mlp_key in state_dict:
+                        # time_mlp.1.weight shape: [channels[i], time_emb_dim]
+                        block_channel = state_dict[time_mlp_key].shape[0]
+                        detected_channels.append(block_channel)
                     else:
-                        # Method 2: Check next block's res block time_mlp
-                        next_time_mlp_key = f'down_blocks.{i+1}.res1.time_mlp.1.weight'
-                        if next_time_mlp_key in state_dict:
-                            # time_mlp.1.weight shape: [channels[i+1], time_emb_dim]
-                            next_channel = state_dict[next_time_mlp_key].shape[0]
-                            detected_channels.append(next_channel)
+                        # If res1 doesn't exist, try res2
+                        time_mlp_key = f'down_blocks.{i}.res2.time_mlp.1.weight'
+                        if time_mlp_key in state_dict:
+                            block_channel = state_dict[time_mlp_key].shape[0]
+                            detected_channels.append(block_channel)
                         else:
                             break
                 
-                # Get last channel from bottleneck (most reliable)
+                # Verify with bottleneck (most reliable for last channel)
                 bottleneck_key = 'bottleneck.time_mlp.1.weight'
                 if bottleneck_key in state_dict:
                     bottleneck_channel = state_dict[bottleneck_key].shape[0]
-                    # Replace or add last channel with bottleneck
-                    if len(detected_channels) == len(self.config.unet_channels):
-                        detected_channels[-1] = bottleneck_channel
-                    elif len(detected_channels) < len(self.config.unet_channels):
+                    # Replace last channel with bottleneck if it differs (bottleneck is ground truth)
+                    if len(detected_channels) > 0:
+                        if detected_channels[-1] != bottleneck_channel:
+                            detected_channels[-1] = bottleneck_channel
+                    else:
                         detected_channels.append(bottleneck_channel)
                 
                 # Ensure we have the right number of channels
