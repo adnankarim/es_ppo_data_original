@@ -2220,6 +2220,7 @@ class ImageDDPM:
     ):
         self.image_size = image_size
         self.in_channels = in_channels
+        self.channels = channels  # Store channels for checkpoint saving
         self.timesteps = timesteps
         self.device = torch.device(device)
         self.conditional = conditional
@@ -3670,6 +3671,12 @@ class BBBC021AblationRunner:
             state['use_transformer'] = model.use_transformer
         elif hasattr(model.model, 'use_transformer'):
             state['use_transformer'] = model.model.use_transformer
+        
+        # Add channel configuration for proper loading
+        if hasattr(model, 'channels'):
+            state['channels'] = model.channels
+        elif hasattr(model.model, 'channels'):
+            state['channels'] = model.model.channels
             
         # Add FID to state if provided
         if fid is not None:
@@ -5811,13 +5818,67 @@ Learned Statistics:
         
         if use_transformer != self.config.use_transformer:
             print(f"  [OVERRIDE] Setting use_transformer={use_transformer} to match checkpoint architecture (config had {self.config.use_transformer})")
-
-        # 1. Initialize Model Architecture with detected architecture
+        
+        # Detect channel configuration from checkpoint (for U-Net only)
+        detected_channels = self.config.unet_channels  # Default to config value
+        if not use_transformer and 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            # Try to infer channels from init_conv and down_blocks
+            # Note: state_dict keys don't have 'model.' prefix (they come directly from model.state_dict())
+            if 'init_conv.weight' in state_dict:
+                # init_conv.weight shape: [channels[0], in_channels, 3, 3]
+                first_channel = state_dict['init_conv.weight'].shape[0]
+                detected_channels = [first_channel]
+                
+                # Infer remaining channels from down_blocks
+                # down_blocks.0.downsample.weight shape: [channels[1], channels[0], 4, 4]
+                # down_blocks.1.downsample.weight shape: [channels[2], channels[1], 4, 4]
+                # etc.
+                for i in range(4):  # Typically 4 down_blocks (0, 1, 2, 3)
+                    downsample_key = f'down_blocks.{i}.downsample.weight'
+                    if downsample_key in state_dict:
+                        next_channel = state_dict[downsample_key].shape[0]
+                        detected_channels.append(next_channel)
+                    else:
+                        break
+                
+                # If we still don't have enough channels, check if checkpoint has metadata
+                if 'channels' in checkpoint:
+                    detected_channels = checkpoint['channels']
+                    print(f"  [CHANNEL DETECTION] Found channels in checkpoint metadata: {detected_channels}")
+                elif len(detected_channels) < len(self.config.unet_channels):
+                    # Pad with last detected channel or use config default
+                    last_channel = detected_channels[-1] if detected_channels else self.config.unet_channels[0]
+                    while len(detected_channels) < len(self.config.unet_channels):
+                        detected_channels.append(last_channel)
+                    print(f"  [CHANNEL DETECTION] Padded channels to match config length: {detected_channels}")
+                
+                # Truncate if we detected too many
+                detected_channels = detected_channels[:len(self.config.unet_channels)]
+                
+                if detected_channels != list(self.config.unet_channels):
+                    print(f"  [CHANNEL DETECTION] Detected channels from checkpoint: {detected_channels}")
+                    print(f"  [OVERRIDE] Using detected channels (config had {list(self.config.unet_channels)})")
+                    # Override self.config.unet_channels for this evaluation
+                    self.config.unet_channels = detected_channels
+                else:
+                    print(f"  [CHANNEL DETECTION] Channels match config: {detected_channels}")
+            elif 'channels' in checkpoint:
+                # Fallback: check if checkpoint has channels in metadata
+                detected_channels = checkpoint['channels']
+                print(f"  [CHANNEL DETECTION] Found channels in checkpoint metadata: {detected_channels}")
+                if detected_channels != list(self.config.unet_channels):
+                    print(f"  [OVERRIDE] Using detected channels (config had {list(self.config.unet_channels)})")
+                    self.config.unet_channels = detected_channels
+            else:
+                print(f"  [CHANNEL DETECTION] Could not detect channels from checkpoint, using config: {list(self.config.unet_channels)}")
+        
+        # 1. Initialize Model Architecture with detected architecture and channels
         # Create model directly (no need for pretrained model transfer in eval mode)
         model = ImageDDPM(
             image_size=self.config.image_size,
             in_channels=self.config.num_channels,
-            channels=self.config.unet_channels,
+            channels=self.config.unet_channels,  # Now uses detected channels if available
             timesteps=self.config.ddpm_timesteps,
             time_emb_dim=self.config.time_embed_dim,
             lr=self.config.ddpm_lr,
