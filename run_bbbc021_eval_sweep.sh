@@ -10,7 +10,7 @@ SCRIPT=run_bbbc021_ablation.py
 DATA_DIR="/home/jovyan/es_ppo_data_original/data/bbbc021_all"
 METADATA_FILE="metadata/bbbc021_df_all.csv"
 
-UNET_CHANNELS="192 384 768 768"
+UNET_CHANNELS="64 128 256 512"
 PERT_EMBED_DIM=768
 BATCH_SIZE=64
 
@@ -42,6 +42,7 @@ for CKPT in "${CHECKPOINTS[@]}"; do
       --mode evaluate \
       --checkpoint-path "$CKPT" \
       --eval-samples "$N" \
+      --eval-split test \
       --eval-batch-size "$BATCH_SIZE" \
       --data-dir "$DATA_DIR" \
       --metadata-file "$METADATA_FILE" \
