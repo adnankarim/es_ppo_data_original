@@ -16,7 +16,7 @@ PERT_EMBED_DIM=768
 BATCH_SIZE=64
 
 # Evaluation sample sizes
-EVAL_SAMPLES_LIST=(50 100 1000 2500 5000)
+EVAL_SAMPLES_LIST=(1000 2500 5000)
 
 # -----------------------------
 # Checkpoints (FIXED PATHS)
@@ -52,7 +52,7 @@ for CKPT in "${CHECKPOINTS[@]}"; do
       --perturbation-embed-dim "$PERT_EMBED_DIM" \
       --use-ema \
       --aux-device cuda \
-      --num-sampling-steps 1000
+      --num-sampling-steps 50
 
     echo ""
     echo "✓ Completed evaluation with ${N} samples"
