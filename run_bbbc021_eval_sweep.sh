@@ -16,7 +16,7 @@ PERT_EMBED_DIM=768
 BATCH_SIZE=64
 
 # Evaluation sample sizes
-EVAL_SAMPLES_LIST=(50 1000 2500 5000)
+EVAL_SAMPLES_LIST=(50 100 1000 2500 5000)
 
 # -----------------------------
 # Checkpoints (FIXED PATHS)
