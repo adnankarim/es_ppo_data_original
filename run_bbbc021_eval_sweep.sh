@@ -21,7 +21,7 @@ EVAL_SAMPLES_LIST=(1000 2500 5000)
 # Checkpoints (FIXED PATHS)
 # -----------------------------
 CHECKPOINTS=(
-  "bbbc021_ablation_results/run_20260110_163415_single/models/ddpm_pretrain_latest.pt"
+  "es_ppo_data_original/global_pretrained_models/ddpm_base_latest.pt"
 )
 
 # -----------------------------
