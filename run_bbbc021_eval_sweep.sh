@@ -9,6 +9,7 @@ SCRIPT=run_bbbc021_ablation.py
 
 DATA_DIR="/home/jovyan/es_ppo_data_original/data/bbbc021_all"
 METADATA_FILE="metadata/bbbc021_df_all.csv"
+BASE_DIR="/home/jovyan/es_ppo_data_original"
 
 UNET_CHANNELS="64 128 256 512"
 PERT_EMBED_DIM=768
@@ -21,7 +22,7 @@ EVAL_SAMPLES_LIST=(1000 2500 5000)
 # Checkpoints (FIXED PATHS)
 # -----------------------------
 CHECKPOINTS=(
-  "es_ppo_data_original/global_pretrained_models/ddpm_base_latest.pt"
+  "${BASE_DIR}/global_pretrained_models/ddpm_base_latest.pt"
 )
 
 # -----------------------------
